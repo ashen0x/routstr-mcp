@@ -1,0 +1,42 @@
+{
+  "name": "routstr-mcp",
+  "version": "0.1.0",
+  "description": "Any of Routstr's AI models as a tool for your agent, paid in sats from a prepaid key that cannot overspend",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "routstr-mcp": "dist/src/index.js"
+  },
+  "files": [
+    "dist/src"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "test:e2e": "npm run build && node --test dist/test/e2e/*.test.js"
+  },
+  "keywords": [
+    "mcp",
+    "routstr",
+    "cashu",
+    "bitcoin",
+    "lightning",
+    "llm"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "nostr-tools": "2.25.2",
+    "qrcode-terminal": "0.12.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@types/qrcode-terminal": "0.12.2",
+    "typescript": "5.9.3"
+  }
+}

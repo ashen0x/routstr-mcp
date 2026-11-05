@@ -1,0 +1,147 @@
+#!/usr/bin/env node
+import readline from "node:readline";
+import { parseArgs } from "node:util";
+import qrcode from "qrcode-terminal";
+import { host, sats, version } from "./format.js";
+import { Market, normalizeNode, offersFor, unitCost } from "./market.js";
+import { balanceReport, serve } from "./server.js";
+import { balanceOf, createInvoice, importKey, keyFor, readWallet, refundFile, refundKey, settleInvoice } from "./wallet.js";
+
+const USAGE = `routstr-mcp ${version}: Routstr models as tools for your agent, paid in sats.
+
+  routstr-mcp                         start the MCP server (what your MCP app runs)
+  routstr-mcp fund <sats>             pay a Lightning invoice to add sats
+      --model <id>                    on the cheapest node that sells this model
+      --node <url>                    on this node
+  routstr-mcp balance                 sats left, per node
+  routstr-mcp refund                  take all unspent sats back as a Cashu token
+      --to <lightning address>        or send them to a Lightning address
+      --node <url>                    only from this node
+  routstr-mcp nodes                   approved nodes and how many models each sells
+  routstr-mcp import --node <url>     add a Routstr key you already have (read from stdin)
+
+Add it to Claude Code:  claude mcp add routstr -- npx -y routstr-mcp`;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function pickNode(market: Market, node?: string, model?: string): Promise<string> {
+  if (node) return normalizeNode(node);
+  const { offers } = await market.load();
+  if (model) {
+    const cheapest = offersFor(offers, model).sort((a, b) => unitCost(a) - unitCost(b))[0];
+    if (!cheapest) throw new Error(`No approved node sells "${model}".`);
+    console.log(`${host(cheapest.node)} sells ${cheapest.id} cheapest.`);
+    return cheapest.node;
+  }
+  const funded = readWallet().keys[0];
+  if (funded) return funded.node;
+  const counts = new Map<string, number>();
+  for (const o of offers) counts.set(o.node, (counts.get(o.node) ?? 0) + 1);
+  const [best] = [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  if (!best) throw new Error("No approved node answered. Try again, or pass --node <url>.");
+  console.log(`${host(best[0])} sells the most models (${best[1]}).`);
+  return best[0];
+}
+
+async function fund(amountArg: string | undefined, node?: string, model?: string) {
+  const amount = Number(amountArg);
+  if (!Number.isInteger(amount) || amount < 1 || amount > 1_000_000)
+    throw new Error("Say how many sats to add, a whole number from 1 to 1,000,000. Example: routstr-mcp fund 2000");
+  const target = await pickNode(new Market(), node, model);
+  const invoice = await createInvoice(target, amount);
+  console.log(`\nPay ${sats(amount)} sats to ${invoice.key ? "top up your key on" : "open a key on"} ${host(target)}:\n`);
+  qrcode.generate(invoice.bolt11, { small: true });
+  console.log(`\n${invoice.bolt11}\n\nWaiting for the payment. Ctrl-C is safe: a payment made later is picked up the next time the wallet is used.`);
+  while (Date.now() / 1000 < invoice.expiresAt + 60) {
+    await sleep(2000);
+    let state;
+    try {
+      state = await settleInvoice(invoice);
+    } catch {
+      continue;
+    }
+    if (state === "expired") throw new Error("The invoice expired before it was paid. Nothing was charged.");
+    if (state === "paid") {
+      const key = keyFor(target);
+      const balance = key ? await balanceOf(key) : undefined;
+      console.log(`\nPaid. ${balance?.sats !== undefined ? `You have ${sats(balance.sats)} sats on ${host(target)}.` : ""}`);
+      return;
+    }
+  }
+  throw new Error("The invoice expired before it was paid. Nothing was charged.");
+}
+
+async function refund(to?: string, node?: string) {
+  const keys = readWallet().keys.filter((k) => !node || k.node === normalizeNode(node));
+  if (!keys.length) return console.log("There is nothing to refund.");
+  for (const key of keys) {
+    const r = await refundKey(key, to);
+    if (r.error) console.log(`${host(r.node)}: could not refund: ${r.error}`);
+    else if (r.token)
+      console.log(`${host(r.node)}: ${sats(r.sats ?? 0)} sats as a Cashu token (also saved in ${refundFile()}):\n${r.token}\n`);
+    else console.log(`${host(r.node)}: sent ${sats(r.sats ?? 0)} sats to ${r.sentTo ?? to}.`);
+  }
+}
+
+async function nodes() {
+  const { offers, reached, missed } = await new Market().load(true);
+  for (const node of reached)
+    console.log(`${host(node)}  ${offers.filter((o) => o.node === node).length} models`);
+  for (const node of missed) console.log(`${host(node)}  did not answer`);
+}
+
+async function readSecret(prompt: string): Promise<string> {
+  if (!process.stdin.isTTY) {
+    let data = "";
+    for await (const chunk of process.stdin) data += chunk;
+    return data.trim();
+  }
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+  process.stdout.write(prompt);
+  (rl as unknown as { _writeToOutput: (s: string) => void })._writeToOutput = () => {};
+  const answer = await new Promise<string>((resolve) => rl.question("", resolve));
+  rl.close();
+  process.stdout.write("\n");
+  return answer.trim();
+}
+
+async function main() {
+  const { positionals, values } = parseArgs({
+    allowPositionals: true,
+    options: {
+      node: { type: "string" },
+      model: { type: "string" },
+      to: { type: "string" },
+      help: { type: "boolean", short: "h" },
+      version: { type: "boolean", short: "v" },
+    },
+  });
+  const [command, arg] = positionals;
+  if (values.help || command === "help") return console.log(USAGE);
+  if (values.version) return console.log(version);
+  switch (command) {
+    case undefined:
+    case "serve":
+      return serve();
+    case "fund":
+      return fund(arg, values.node, values.model);
+    case "balance":
+      return console.log(await balanceReport());
+    case "refund":
+      return refund(values.to, values.node);
+    case "nodes":
+      return nodes();
+    case "import": {
+      if (!values.node) throw new Error("Say which node the key belongs to: routstr-mcp import --node <url>");
+      const balance = await importKey(values.node, await readSecret("Paste the sk- key (hidden): "));
+      return console.log(`Added. ${sats(balance.sats ?? 0)} sats on ${host(balance.node)}.`);
+    }
+    default:
+      throw new Error(`Unknown command "${command}".\n\n${USAGE}`);
+  }
+}
+
+main().catch((e) => {
+  console.error((e as Error).message);
+  process.exit(1);
+});
