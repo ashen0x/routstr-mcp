@@ -103,11 +103,13 @@ export async function ask(market: Market, input: AskInput): Promise<Answer> {
             continue;
           }
         }
-        // try the next node when this one is down or this key is short; anything else is the request's fault
-        if (e.status === 0 || e.status === 402 || e.status >= 500) {
+        // try the next node only when this one never got the request, or refused it without charging
+        if (e.code === "unreachable" || e.status === 402 || e.status >= 500) {
           problems.push(e.status === 0 ? e.message : `${host(offer.node)}: ${e.status === 402 ? "not enough sats left on this node" : e.message}`);
           break;
         }
+        // trying another node now could pay twice
+        if (e.status === 0) throw new AskError(`${e.message} while answering; it may still charge for this call.`);
         throw new AskError(`${host(offer.node)} refused the request: ${e.message}`);
       }
     }
@@ -125,7 +127,7 @@ async function complete(offer: Offer, key: Key, messages: object[], maxTokens: n
   const charged = headers.get("x-routstr-cost-msats");
   const usage = body.usage;
   const costSats =
-    charged !== null && Number.isFinite(Number(charged))
+    charged !== null && Number(charged) >= 0
       ? Number(charged) / 1000
       : (usage?.prompt_tokens ?? promptTokens) * offer.promptRate + (usage?.completion_tokens ?? 0) * offer.completionRate;
   const left = await balanceOf(key);

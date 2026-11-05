@@ -16,7 +16,22 @@ Use it for a second opinion from a different model, to compare several models wi
 Each call costs a few sats from the user's prepaid Routstr balance and shows the cost. The prepaid balance is a hard limit.
 Use find_models when you are unsure of a model id. Never ask the user for API keys, Cashu tokens or invoices. ${FUND_HINT}`;
 
-const text = (value: string, isError = false) => ({ content: [{ type: "text" as const, text: value }], isError });
+/** The agent never sees a wallet secret, even when a node echoes one back in an answer or an error. */
+function redact(value: string): string {
+  let secrets: string[];
+  try {
+    const wallet = readWallet();
+    secrets = [...wallet.keys.map((k) => k.key), ...wallet.pending.flatMap((p) => [p.bolt11, p.key ?? ""])];
+  } catch {
+    return value;
+  }
+  return secrets
+    .flatMap((secret) => [secret, secret.replace(/^sk-/, "")])
+    .filter((secret) => secret.length >= 16)
+    .reduce((out, secret) => out.split(secret).join("[secret removed]"), value);
+}
+
+const text = (value: string, isError = false) => ({ content: [{ type: "text" as const, text: redact(value) }], isError });
 
 const footer = (a: Answer) =>
   `${a.model} on ${host(a.node)} · ${sats(a.costSats)} sats` +

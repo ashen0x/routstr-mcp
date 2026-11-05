@@ -32,6 +32,33 @@ function readError(body: unknown): ErrorBody {
   return {};
 }
 
+/** Status 0 with code "unreachable" means the request never got there; "timeout" means it may have. */
+function networkError(node: string, e: unknown): NodeError {
+  const timedOut = e instanceof Error && e.name === "TimeoutError";
+  return new NodeError(node, 0, `${new URL(node).host} ${timedOut ? "timed out" : "is unreachable"}`, timedOut ? "timeout" : "unreachable");
+}
+
+/** Model lists and answers are well under this; a node sending more is cut off before it can fill memory. */
+const MAX_BODY_BYTES = 16 * 1024 * 1024;
+
+async function readCapped(node: string, res: Response): Promise<string> {
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for await (const chunk of res.body ?? []) {
+      size += chunk.byteLength;
+      if (size > MAX_BODY_BYTES) {
+        throw new NodeError(node, 0, `${new URL(node).host} sent an answer over ${MAX_BODY_BYTES >> 20} MB`, "too_big");
+      }
+      chunks.push(chunk);
+    }
+  } catch (e) {
+    if (e instanceof NodeError) throw e;
+    throw networkError(node, e);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 export interface NodeResponse<T> {
   body: T;
   headers: Headers;
@@ -54,10 +81,9 @@ export async function request<T>(
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (e) {
-    const reason = e instanceof Error && e.name === "TimeoutError" ? "timed out" : "unreachable";
-    throw new NodeError(node, 0, `${new URL(node).host} is ${reason}`);
+    throw networkError(node, e);
   }
-  const text = await res.text();
+  const text = await readCapped(node, res);
   let body: unknown;
   try {
     body = text ? JSON.parse(text) : undefined;

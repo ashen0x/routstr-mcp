@@ -51,6 +51,7 @@ function writeWallet(wallet: WalletFile) {
   fs.renameSync(tmp, walletFile());
 }
 
+const LOCK_STALE_MS = 10_000;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Read, change and write the wallet under a lock, so the server and the CLI never lose each other's writes. */
@@ -63,11 +64,12 @@ async function updateWallet<T>(change: (wallet: WalletFile) => T): Promise<T> {
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
       try {
-        if (Date.now() - fs.statSync(lockFile()).mtimeMs > 10_000) fs.rmSync(lockFile(), { force: true });
+        if (Date.now() - fs.statSync(lockFile()).mtimeMs > LOCK_STALE_MS) fs.rmSync(lockFile(), { force: true });
       } catch {
         /* the holder just released it */
       }
-      if (tries > 200) throw new Error(`The wallet is locked by another process (${lockFile()})`);
+      // wait past the stale age, so a lock left by a crashed process is cleared rather than failing the write
+      if (tries * 25 > LOCK_STALE_MS + 5000) throw new Error(`The wallet is locked by another process (${lockFile()})`);
       await sleep(25);
     }
   }
@@ -155,7 +157,8 @@ export async function balanceOf(key: Key): Promise<Balance> {
     const { body } = await request<{ balance: number; reserved: number }>(key.node, "/v1/balance/info", {
       key: key.key,
     });
-    return { node: key.node, sats: body.balance / 1000, reservedSats: body.reserved / 1000 };
+    if (!Number.isFinite(body?.balance)) throw new Error(`${new URL(key.node).host} sent a balance that is not a number`);
+    return { node: key.node, sats: body.balance / 1000, reservedSats: Number.isFinite(body.reserved) ? body.reserved / 1000 : 0 };
   } catch (e) {
     return { node: key.node, error: (e as Error).message };
   }

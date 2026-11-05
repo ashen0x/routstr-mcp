@@ -190,19 +190,26 @@ interface RawModel {
   sats_pricing?: { prompt?: number; completion?: number } | null;
 }
 
-/** Text models a node prices in sats. Zero-priced models are left out: their real price is unknown. */
-export function parseOffers(node: string, models: RawModel[]): Offer[] {
-  return models
-    .filter((m) => m.enabled !== false && typeof m.id === "string")
+const count = (value: unknown) => (Number.isSafeInteger(value) && (value as number) > 0 ? (value as number) : undefined);
+const rate = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value > 0;
+
+/**
+ * Text models a node prices in sats. Zero-priced models are left out: their real price is unknown.
+ * Ids with spaces or control characters are dropped too, so a node cannot write its own lines into what the agent reads.
+ */
+export function parseOffers(node: string, models: unknown): Offer[] {
+  return (Array.isArray(models) ? (models as RawModel[]) : [])
+    .filter((m) => m && typeof m === "object" && m.enabled !== false)
+    .filter((m) => typeof m.id === "string" && /^[^\s\p{C}]{1,200}$/u.test(m.id))
     .filter((m) => (m.architecture?.output_modalities ?? ["text"]).includes("text"))
-    .filter((m) => (m.sats_pricing?.prompt ?? 0) > 0 && (m.sats_pricing?.completion ?? 0) > 0)
+    .filter((m) => rate(m.sats_pricing?.prompt) && rate(m.sats_pricing?.completion))
     .map((m) => ({
       node,
       id: m.id,
-      name: m.name || m.id,
-      aliases: m.alias_ids ?? [],
-      context: m.top_provider?.context_length ?? m.context_length,
-      maxOutput: m.top_provider?.max_completion_tokens ?? undefined,
+      name: typeof m.name === "string" ? m.name : m.id,
+      aliases: Array.isArray(m.alias_ids) ? m.alias_ids.filter((a) => typeof a === "string") : [],
+      context: count(m.top_provider?.context_length) ?? count(m.context_length),
+      maxOutput: count(m.top_provider?.max_completion_tokens),
       promptRate: m.sats_pricing!.prompt!,
       completionRate: m.sats_pricing!.completion!,
     }));
@@ -217,7 +224,7 @@ export class Market {
     const results = await Promise.allSettled(
       urls.map(async (node) => {
         const { body } = await request<{ data?: RawModel[] }>(node, "/v1/models", { timeoutMs: 10_000 });
-        return parseOffers(node, body?.data ?? []);
+        return parseOffers(node, body?.data);
       })
     );
     const offers: Offer[] = [];
