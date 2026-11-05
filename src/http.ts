@@ -24,11 +24,15 @@ function readError(body: unknown): ErrorBody {
     ? (detail as Record<string, unknown>).error
     : record.error) as Record<string, unknown> | string | undefined;
   if (typeof error === "string") return { message: error };
-  if (error && typeof error === "object")
+  if (error && typeof error === "object") {
+    // a generic "Provider returned error" keeps the real reason in metadata.raw
+    const raw = (error.metadata as { raw?: unknown } | undefined)?.raw;
+    const message = typeof error.message === "string" ? error.message : undefined;
     return {
-      message: typeof error.message === "string" ? error.message : undefined,
+      message: typeof raw === "string" && raw ? `${message ?? "error"}: ${raw}` : message,
       code: typeof error.code === "string" ? error.code : undefined,
     };
+  }
   return {};
 }
 

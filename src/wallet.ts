@@ -183,7 +183,9 @@ export async function balanceOf(key: Key): Promise<Balance> {
       key: key.key,
     });
     if (!Number.isFinite(body?.balance)) throw new Error(`${new URL(key.node).host} sent a balance that is not a number`);
-    return { node: key.node, sats: body.balance / 1000, reservedSats: Number.isFinite(body.reserved) ? body.reserved / 1000 : 0 };
+    // core's `balance` is what is free now; sats held for calls in flight come on top and still belong to the key
+    const reserved = Number.isFinite(body.reserved) ? body.reserved : 0;
+    return { node: key.node, sats: (body.balance + reserved) / 1000, reservedSats: reserved / 1000 };
   } catch (e) {
     return { node: key.node, error: (e as Error).message };
   }

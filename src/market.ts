@@ -229,8 +229,12 @@ export function parseOffers(node: string, models: unknown): Offer[] {
     }));
 }
 
+/** How long a node's last good model list stands in when a refresh of it fails. */
+const LAST_GOOD_MS = 60 * 60_000;
+
 export class Market {
   private cache?: { at: number; offers: Offer[]; reached: string[]; missed: string[] };
+  private lastGood = new Map<string, { at: number; offers: Offer[] }>();
 
   async load(force = false) {
     if (!force && this.cache && Date.now() - this.cache.at < MODELS_TTL_MS) return this.cache;
@@ -245,10 +249,15 @@ export class Market {
     const reached: string[] = [];
     const missed: string[] = [];
     results.forEach((result, i) => {
-      if (result.status === "fulfilled") {
-        offers.push(...result.value);
-        reached.push(urls[i]!);
-      } else missed.push(urls[i]!);
+      const node = urls[i]!;
+      // one slow answer must not hide a node (and the sats on it) until the next refresh
+      const last = this.lastGood.get(node);
+      if (result.status === "fulfilled") this.lastGood.set(node, { at: Date.now(), offers: result.value });
+      const list = result.status === "fulfilled" ? result.value : last && Date.now() - last.at < LAST_GOOD_MS ? last.offers : undefined;
+      if (list) {
+        offers.push(...list);
+        reached.push(node);
+      } else missed.push(node);
     });
     this.cache = { at: Date.now(), offers, reached, missed };
     return this.cache;
@@ -274,6 +283,7 @@ export interface ModelSummary {
   nodes: number;
   context?: number;
   cheapest: Offer;
+  offers: Offer[];
 }
 
 /** Models matching every word of the query, one row per model id, cheapest node first. */
@@ -295,6 +305,7 @@ export function searchModels(offers: Offer[], query = ""): ModelSummary[] {
         nodes: new Set(group.map((o) => o.node)).size,
         context: cheapest.context,
         cheapest,
+        offers: group,
       };
     })
     .sort((a, b) => unitCost(a.cheapest) - unitCost(b.cheapest));

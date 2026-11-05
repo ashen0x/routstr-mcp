@@ -124,18 +124,21 @@ export function createServer(market = new Market()): McpServer {
       try {
         const { offers, reached, missed } = await market.load();
         const funded = new Set(readWallet().keys.map((k) => k.node));
-        const fundedIds = new Set(offers.filter((o) => funded.has(o.node)).map((o) => o.id.toLowerCase()));
         const rows = searchModels(offers, query);
-        const shown = rows.slice(0, limit ?? 20).map(
-          (m) =>
+        const shown = rows.slice(0, limit ?? 20).map((m) => {
+          // the price ask would pay: the cheapest node with sats on it, else the cheapest node
+          const paid = m.offers.filter((o) => funded.has(o.node)).sort((a, b) => unitCost(a) - unitCost(b))[0];
+          const at = paid ?? m.cheapest;
+          return (
             `${m.id} · ${m.nodes} node${m.nodes > 1 ? "s" : ""} · ${tokens(m.context)} context · ` +
-            `${perMillion(m.cheapest.promptRate)} / ${perMillion(m.cheapest.completionRate)} · ` +
-            `typical ${sats(unitCost(m.cheapest))} sats${fundedIds.has(m.id.toLowerCase()) ? " · funded" : ""}`
-        );
+            `${perMillion(at.promptRate)} / ${perMillion(at.completionRate)} · ` +
+            `typical ${sats(unitCost(at))} sats${paid ? ` · funded${at !== m.cheapest && unitCost(m.cheapest) < unitCost(at) ? ` (cheapest elsewhere: typical ${sats(unitCost(m.cheapest))})` : ""}` : ""}`
+          );
+        });
         const head =
           `${rows.length} model${rows.length === 1 ? "" : "s"}${query ? ` match "${query}"` : ""} on ${reached.length} node${reached.length === 1 ? "" : "s"}` +
           `${missed.length ? ` (${missed.length} did not answer)` : ""}. ` +
-          "Prices are sats per 1M tokens in / out at the cheapest node; typical = 2k tokens in, 1k out; funded = you have sats where it is sold.";
+          "Prices are sats per 1M tokens in / out where ask would pay: the cheapest node you have sats on, else the cheapest node. typical = 2k tokens in, 1k out; funded = you have sats where it is sold.";
         return text([head, ...shown, rows.length > shown.length ? `…and ${rows.length - shown.length} more.` : ""].filter(Boolean).join("\n"));
       } catch (e) {
         return text((e as Error).message, true);

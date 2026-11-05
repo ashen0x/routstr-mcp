@@ -61,15 +61,17 @@ export class AskError extends Error {}
 
 export async function ask(market: Market, input: AskInput): Promise<Answer> {
   await settleAll();
-  const { offers } = await market.load();
+  const { offers, missed } = await market.load();
   const all = offersFor(offers, input.model);
-  if (!all.length)
-    throw new AskError(`No approved Routstr node sells "${input.model}". Use find_models to see the exact model ids.`);
-
   const keys = new Map<string, Key>();
   for (const k of readWallet().keys) if (!keys.has(k.node)) keys.set(k.node, k);
   const payable = all.filter((o) => keys.has(o.node)).sort((a, b) => unitCost(a) - unitCost(b));
   if (!payable.length) {
+    const silent = missed.filter((node) => keys.has(node));
+    if (silent.length)
+      throw new AskError(`Your sats are on ${silent.map(host).join(", ")}, which did not answer just now. Try again in a minute.`);
+    if (!all.length)
+      throw new AskError(`No approved Routstr node sells "${input.model}". Use find_models to see the exact model ids.`);
     const cheapest = [...all].sort((a, b) => unitCost(a) - unitCost(b))[0]!;
     throw new AskError(
       keys.size
@@ -103,8 +105,8 @@ export async function ask(market: Market, input: AskInput): Promise<Answer> {
         if (!(e instanceof NodeError)) throw e;
         if (e.status === 402 && attempt === 0) {
           // the key holds less than this call may cost: fit the answer to what is left, with room for the node's own estimate
-          const { sats: held = 0, reservedSats = 0 } = await balanceOf(key);
-          const spendable = (held - reservedSats) * 0.9;
+          const { sats: owned = 0, reservedSats = 0 } = await balanceOf(key);
+          const spendable = (owned - reservedSats) * 0.9;
           if (spendable < budget) {
             budget = spendable;
             continue;
