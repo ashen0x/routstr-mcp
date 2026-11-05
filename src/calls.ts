@@ -131,8 +131,8 @@ async function complete(offer: Offer, key: Key, messages: object[], maxTokens: n
   const { body, headers } = await request<ChatResponse>(offer.node, "/v1/chat/completions", {
     method: "POST",
     key: key.key,
-    // long enough for a slow reasoning model to write the whole budget (20 tokens a second), since a cut-off call is still billed
-    timeoutMs: 60_000 + maxTokens * 50,
+    // long enough for a slow reasoning model to write the whole budget (10 tokens a second), since a cut-off call is still billed
+    timeoutMs: 60_000 + maxTokens * 100,
     body: JSON.stringify({ model: offer.id, messages, max_tokens: maxTokens, stream: false }),
   });
   const charged = headers.get("x-routstr-cost-msats");
