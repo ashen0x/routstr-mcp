@@ -122,7 +122,7 @@ test("max_sats caps the answer length the node reserves for", { skip }, async ()
   const sent = upstream.seen.at(-1)!;
   const models = (await (await fetch(`${nodeA.url}/v1/models`)).json()) as { data: { id: string; sats_pricing: { prompt: number; completion: number } }[] };
   const rates = models.data.find((m) => m.id === "e2e-smart")!.sats_pricing;
-  const promptTokens = Math.ceil("short one".length / 3) + 8;
+  const promptTokens = Math.ceil("short one".length / 2) + 8;
   assert.equal(sent.max_tokens, Math.floor((6 - promptTokens * rates.prompt) / rates.completion));
 
   const tooLow = await tool("ask", { model: "e2e-smart", prompt: "x".repeat(3000), max_sats: 2 });

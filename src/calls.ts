@@ -4,12 +4,13 @@ import { offersFor, unitCost, type Market, type Offer } from "./market.js";
 import { balanceOf, readWallet, settleAll, type Key } from "./wallet.js";
 
 /**
- * A token count that errs high, so the per-call cap holds: about 3 characters a token for ASCII, and
- * one token per UTF-8 byte for the rest (Chinese, Russian, emoji), since a byte-level tokenizer never needs more.
+ * A token count that errs high, so the per-call cap holds: 2 characters a token for ASCII (code runs
+ * near 2.4, prose near 4), and one token per UTF-8 byte for the rest (Chinese, Russian, emoji), since a
+ * byte-level tokenizer never needs more.
  */
 export function estimateTokens(text: string): number {
   const ascii = text.replace(/[^\x00-\x7f]/g, "");
-  return Math.ceil(ascii.length / 3) + (Buffer.byteLength(text, "utf8") - ascii.length) + 8;
+  return Math.ceil(ascii.length / 2) + (Buffer.byteLength(text, "utf8") - ascii.length) + 8;
 }
 
 const OUTPUT_CEILING = 8192;

@@ -115,7 +115,7 @@ test("the token estimate errs high for non-Latin text, so max_sats holds", () =>
   // cl100k gives 1,600 tokens for each of these
   assert.ok(estimateTokens("比特币是一种去中心化的数字货币".repeat(100)) >= 1600);
   assert.ok(estimateTokens("🦜🧪🛰️🧬🪐".repeat(100)) >= 1600);
-  assert.equal(estimateTokens("short one"), Math.ceil(9 / 3) + 8);
+  assert.equal(estimateTokens("short one"), Math.ceil(9 / 2) + 8);
 });
 
 test("sats reads well at every size", () => {
