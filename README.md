@@ -56,7 +56,7 @@ routstr-mcp import --node <url>     add a Routstr key you already have (read fro
 
 - **The prepaid balance is a hard cap.** Your sats sit on the node as the balance of a Routstr API key. Nothing can spend more than you paid in.
 - **Each call has its own cap.** The agent can pass `max_sats` (default 100, at most 500). The answer length is set so the call fits under it, and the cost is shown after every answer.
-- **The agent never sees a secret.** API keys, invoices and Cashu tokens stay in the wallet file and the terminal. Funding and refunds are terminal commands only, so a prompt injection cannot pull your sats out.
+- **The agent never sees a secret.** API keys, invoices and Cashu tokens stay in the wallet file and the terminal, and are removed from anything a node sends back. There is no tool that funds or refunds, so the MCP tools alone cannot move your sats. An agent that also has a shell (Claude Code, Cursor) could still run the CLI or read the wallet file, so keep your app asking before it runs commands.
 - **The wallet is private.** It lives in `~/.routstr-mcp/wallet.json`, readable only by you. A refund token is also saved in `~/.routstr-mcp/refunds/` before the key is dropped, so a crash cannot lose it.
 - **A stopped payment is not lost.** If you pay after closing the `fund` command, the sats are picked up the next time the wallet is used.
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { finalizeEvent, generateSecretKey, getPublicKey, type Event } from "nostr-tools/pure";
-import { outputBudget } from "../src/calls.js";
+import { estimateTokens, outputBudget } from "../src/calls.js";
 import { sats } from "../src/format.js";
 import { approvedNodes, isPublicUrl, offersFor, parseOffers, searchModels, type Offer } from "../src/market.js";
 
@@ -54,6 +54,10 @@ test("isPublicUrl keeps public https hosts and drops LAN, localhost, onion and p
     "https://umbrel",
     "https://node.local",
     "https://abc.onion",
+    "https://localhost.",
+    "https://198.18.0.1",
+    "https://224.0.0.1",
+    "https://[64:ff9b::a00:1]",
   ])
     assert.ok(!isPublicUrl(url), url);
 });
@@ -89,6 +93,8 @@ test("offersFor matches the exact id or alias first, then the name without its m
   assert.deepEqual(offersFor(offers, "gpt-5").map((o) => o.node), ["https://b.example"]);
   assert.deepEqual(offersFor(offers, "anthropic/gpt-5").length, 2);
   assert.deepEqual(offersFor(offers, "ALIAS-X").map((o) => o.id), ["x"]);
+  const squatted = [offer("gpt-5", 1, 1), offer("junk", 0.1, 0.1, { aliases: ["gpt-5"] })];
+  assert.deepEqual(offersFor(squatted, "gpt-5").map((o) => o.id), ["gpt-5"], "a real id beats another node's alias");
 });
 
 test("searchModels needs every word and sorts cheapest first", () => {
@@ -103,6 +109,13 @@ test("outputBudget fits the answer in the sats cap and the model's limit", () =>
   assert.equal(outputBudget(smart, 100, 1000), 2048);
   assert.equal(outputBudget(offer("big", 0.0001, 0.0001), 10, 1000), 8192);
   assert.ok(outputBudget(smart, 1000, 5) < 0);
+});
+
+test("the token estimate errs high for non-Latin text, so max_sats holds", () => {
+  // cl100k gives 1,600 tokens for each of these
+  assert.ok(estimateTokens("比特币是一种去中心化的数字货币".repeat(100)) >= 1600);
+  assert.ok(estimateTokens("🦜🧪🛰️🧬🪐".repeat(100)) >= 1600);
+  assert.equal(estimateTokens("short one"), Math.ceil(9 / 3) + 8);
 });
 
 test("sats reads well at every size", () => {

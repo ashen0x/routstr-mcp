@@ -184,6 +184,32 @@ export async function startMint(dir: string): Promise<Service> {
   return { url, log, stop };
 }
 
+/** A pass-through in front of the mint that can hold back news of payments, like a payment still on its way. */
+export async function startMintProxy(target: string) {
+  let hiding = false;
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (d) => chunks.push(d));
+    req.on("end", async () => {
+      const upstream = await fetch(`${target}${req.url}`, {
+        method: req.method,
+        headers: { "content-type": req.headers["content-type"] ?? "application/json" },
+        body: chunks.length ? Buffer.concat(chunks) : undefined,
+      });
+      let text = await upstream.text();
+      if (hiding && req.method === "GET" && req.url?.startsWith("/v1/mint/quote/bolt11/"))
+        text = text.replace(/"state":\s*"PAID"/g, '"state":"UNPAID"').replace(/"paid":\s*true/g, '"paid":false');
+      res.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" }).end(text);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return {
+    url: `http://127.0.0.1:${(server.address() as net.AddressInfo).port}`,
+    hidePayments: (on: boolean) => (hiding = on),
+    close: () => new Promise<void>((resolve) => (server.closeAllConnections(), server.close(() => resolve()))),
+  };
+}
+
 const LAUNCHER = new URL("../../../test/e2e/core_launcher.py", import.meta.url).pathname;
 
 /** Real routstr-core, paid through `mintUrl`, answering from the fake upstream. */

@@ -40,15 +40,29 @@ export function readWallet(): WalletFile {
     return { version: 1, keys: parsed.keys ?? [], pending: parsed.pending ?? [] };
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return { version: 1, keys: [], pending: [] };
-    throw new Error(`Cannot read ${walletFile()}: ${(e as Error).message}`);
+    throw new Error(`Cannot read ${walletFile()}: ${e instanceof SyntaxError ? "it is not valid JSON" : (e as Error).message}`);
   }
 }
 
 function writeWallet(wallet: WalletFile) {
   fs.mkdirSync(config.home, { recursive: true, mode: 0o700 });
   const tmp = `${walletFile()}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(wallet, null, 2), { mode: 0o600 });
+  fs.writeFileSync(tmp, JSON.stringify(wallet, null, 2), { mode: 0o600, flush: true });
   fs.renameSync(tmp, walletFile());
+  syncDir(config.home);
+}
+
+/** Makes a rename survive a power cut. */
+function syncDir(dir: string) {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(dir, "r");
+    fs.fsyncSync(fd);
+  } catch {
+    /* not every system can sync a directory */
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
 }
 
 const LOCK_STALE_MS = 10_000;
@@ -116,28 +130,39 @@ export async function createInvoice(nodeUrl: string, sats: number): Promise<Pend
 
 export type InvoiceState = "paid" | "waiting" | "expired";
 
+/** Core says "expired" after an hour but still credits a late payment for a day after that. */
+const CREDIT_GRACE_S = 86_400;
+
+const dropPending = (invoiceId: string) =>
+  updateWallet((wallet) => {
+    wallet.pending = wallet.pending.filter((p) => p.invoiceId !== invoiceId);
+  });
+
 /** Checks one invoice and moves a paid one into the wallet. Safe to repeat. */
 export async function settleInvoice(pending: Pending): Promise<InvoiceState> {
-  const { body } = await request<{ status: string; api_key?: string | null }>(
-    pending.node,
-    `/lightning/invoice/${encodeURIComponent(pending.invoiceId)}/status`
-  );
-  if (body.status === "paid") {
-    const key = body.api_key ?? pending.key;
+  const pastGrace = Date.now() / 1000 > pending.expiresAt + CREDIT_GRACE_S;
+  let body: { status?: string; api_key?: string | null } | undefined;
+  try {
+    ({ body } = await request<typeof body>(pending.node, `/lightning/invoice/${encodeURIComponent(pending.invoiceId)}/status`, { timeoutMs: 5000 }));
+  } catch (e) {
+    if (!pastGrace) throw e;
+    await dropPending(pending.invoiceId);
+    return "expired";
+  }
+  const key = body?.api_key ?? pending.key;
+  if (body?.status === "paid" && key) {
     await updateWallet((wallet) => {
-      if (key && !wallet.keys.some((k) => k.node === pending.node && k.key === key))
+      if (!wallet.keys.some((k) => k.node === pending.node && k.key === key))
         wallet.keys.push({ node: pending.node, key, addedAt: Date.now() });
       wallet.pending = wallet.pending.filter((p) => p.invoiceId !== pending.invoiceId);
     });
     return "paid";
   }
-  if (body.status === "expired") {
-    await updateWallet((wallet) => {
-      wallet.pending = wallet.pending.filter((p) => p.invoiceId !== pending.invoiceId);
-    });
+  if (body?.status === "expired" && pastGrace) {
+    await dropPending(pending.invoiceId);
     return "expired";
   }
-  return "waiting";
+  return body?.status === "expired" ? "expired" : "waiting";
 }
 
 /** Picks up invoices paid since the last look, e.g. after a fund command was stopped. */
@@ -184,7 +209,7 @@ export interface Refund {
  */
 export async function refundKey(key: Key, lightningAddress?: string): Promise<Refund> {
   try {
-    const { body } = await request<{ token?: string; sats?: string; msats?: string; recipient?: string }>(
+    const { body } = await request<{ token?: string; sats?: string; msats?: string; recipient?: string; status?: string }>(
       key.node,
       "/v1/balance/refund",
       {
@@ -194,6 +219,9 @@ export async function refundKey(key: Key, lightningAddress?: string): Promise<Re
         timeoutMs: 60_000,
       }
     );
+    const done = (body?.token || body?.recipient) && (body.status === undefined || body.status === "paid");
+    if (!done)
+      return { node: key.node, error: `the node did not confirm the refund${body?.status ? ` (it says ${body.status})` : ""}; the key is kept, so ask again later` };
     const sats = body.sats !== undefined ? Number(body.sats) : body.msats !== undefined ? Number(body.msats) / 1000 : undefined;
     if (body.token) saveRefundToken(key.node, body.token);
     await updateWallet((wallet) => {
@@ -209,7 +237,8 @@ function saveRefundToken(node: string, token: string) {
   const dir = path.join(config.home, "refunds");
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const name = `${new URL(node).host}-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
-  fs.writeFileSync(path.join(dir, name), `${token}\n`, { mode: 0o600 });
+  fs.writeFileSync(path.join(dir, name), `${token}\n`, { mode: 0o600, flush: true });
+  syncDir(dir);
 }
 
 export const refundFile = () => path.join(config.home, "refunds");

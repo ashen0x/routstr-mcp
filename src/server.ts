@@ -175,11 +175,14 @@ export async function balanceReport(): Promise<string> {
         ? `- ${host(b.node)}: could not check (${b.error})`
         : `- ${host(b.node)}: ${sats(b.sats!)} sats${b.reservedSats ? ` (${sats(b.reservedSats)} held for calls in flight)` : ""}`
     );
-  for (const p of pending) lines.push(`- waiting for payment: ${sats(p.sats)} sats on ${host(p.node)}`);
+  for (const p of pending)
+    lines.push(`- ${Date.now() / 1000 > p.expiresAt ? "expired invoice, still counted if paid late" : "waiting for payment"}: ${sats(p.sats)} sats on ${host(p.node)}`);
   lines.push(FUND_HINT);
   return lines.join("\n");
 }
 
 export async function serve(): Promise<void> {
+  // stdout carries the MCP messages; anything a library logs there (nostr-tools prints relay notices) could pose as one
+  console.log = console.info = console.debug = console.error;
   await createServer().connect(new StdioServerTransport());
 }

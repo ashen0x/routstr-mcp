@@ -78,6 +78,7 @@ export async function request<T>(
     res = await fetch(`${node}${path}`, {
       ...rest,
       headers,
+      redirect: "error",
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (e) {
@@ -92,12 +93,9 @@ export async function request<T>(
   }
   if (!res.ok) {
     const error = readError(body);
-    throw new NodeError(
-      node,
-      res.status,
-      error.message ?? (typeof body === "string" && body ? body.slice(0, 200) : res.statusText),
-      error.code
-    );
+    const message = error.message ?? (typeof body === "string" && body ? body : res.statusText);
+    // node text goes to the agent: one line, short, no control characters
+    throw new NodeError(node, res.status, message.replace(/[\p{C}\s]+/gu, " ").trim().slice(0, 300), error.code);
   }
   return { body: body as T, headers: res.headers };
 }

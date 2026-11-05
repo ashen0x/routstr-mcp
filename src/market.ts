@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { SimplePool } from "nostr-tools/pool";
+import { SimplePool, useWebSocketImplementation } from "nostr-tools/pool";
 import { verifyEvent, type Event } from "nostr-tools/pure";
 import { config } from "./config.js";
 import { request } from "./http.js";
@@ -34,7 +34,7 @@ export function isPublicUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
     if (parsed.protocol !== "https:") return false;
-    host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
   } catch {
     return false;
   }
@@ -48,10 +48,12 @@ export function isPublicUrl(url: string): boolean {
       (a === 100 && b >= 64 && b <= 127) ||
       (a === 169 && b === 254) ||
       (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168)
+      (a === 192 && b === 168) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      a >= 224
     );
   }
-  if (host.includes(":")) return !/^(::|::1|f[cd]|fe[89ab]|::ffff:)/.test(host);
+  if (host.includes(":")) return !/^(::|::1|f[cd]|fe[89ab]|::ffff:|64:ff9b:)/.test(host);
   return true;
 }
 
@@ -134,13 +136,25 @@ export function approvedNodes(
     .sort();
 }
 
+/** Node 22's WebSocket fires error again on close(); nostr-tools closes on error, which would recurse until the stack blows. */
+class OnceClosingWebSocket extends WebSocket {
+  #closing = false;
+  override close(code?: number, reason?: string) {
+    if (this.#closing) return;
+    this.#closing = true;
+    super.close(code, reason);
+  }
+}
+useWebSocketImplementation(OnceClosingWebSocket);
+
 async function discoverNodes(): Promise<string[]> {
   const pool = new SimplePool();
   try {
-    const [announcements, reviews] = await Promise.all([
-      pool.querySync(config.relays, { kinds: [38421], limit: 100 }, { maxWait: 6000 }),
-      pool.querySync(config.relays, { kinds: [38425], authors: [config.curator], limit: 500 }, { maxWait: 6000 }),
-    ]);
+    const reviews = await pool.querySync(config.relays, { kinds: [38425], authors: [config.curator], limit: 500 }, { maxWait: 6000 });
+    // only announcements by reviewed pubkeys can matter, and asking for just those means nobody can crowd them out
+    const reviewed = [...new Set(reviews.flatMap((r) => r.tags.filter((t) => t[0] === "node" && t[1]).map((t) => t[1]!)))];
+    if (!reviewed.length) return [];
+    const announcements = await pool.querySync(config.relays, { kinds: [38421], authors: reviewed }, { maxWait: 6000 });
     return approvedNodes(announcements, reviews, config.curator);
   } finally {
     pool.destroy();
@@ -246,10 +260,11 @@ const bare = (id: string) => id.toLowerCase().split("/").pop()!;
 /** Offers for a model name: exact id or alias first, else the same name without its maker prefix. */
 export function offersFor(offers: Offer[], model: string): Offer[] {
   const wanted = model.trim().toLowerCase();
-  const exact = offers.filter(
-    (o) => o.id.toLowerCase() === wanted || o.aliases.some((a) => a.toLowerCase() === wanted)
-  );
+  // a real id beats an alias, so one node cannot claim a popular name for a different model
+  const exact = offers.filter((o) => o.id.toLowerCase() === wanted);
   if (exact.length) return exact;
+  const aliased = offers.filter((o) => o.aliases.some((a) => a.toLowerCase() === wanted));
+  if (aliased.length) return aliased;
   return offers.filter((o) => bare(o.id) === bare(wanted));
 }
 

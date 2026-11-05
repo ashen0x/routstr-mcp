@@ -3,8 +3,14 @@ import { NodeError, request } from "./http.js";
 import { offersFor, unitCost, type Market, type Offer } from "./market.js";
 import { balanceOf, readWallet, settleAll, type Key } from "./wallet.js";
 
-/** A rough token count that errs high, so the per-call cap holds. */
-export const estimateTokens = (text: string) => Math.ceil(text.length / 3) + 8;
+/**
+ * A token count that errs high, so the per-call cap holds: about 3 characters a token for ASCII, and
+ * one token per UTF-8 byte for the rest (Chinese, Russian, emoji), since a byte-level tokenizer never needs more.
+ */
+export function estimateTokens(text: string): number {
+  const ascii = text.replace(/[^\x00-\x7f]/g, "");
+  return Math.ceil(ascii.length / 3) + (Buffer.byteLength(text, "utf8") - ascii.length) + 8;
+}
 
 const OUTPUT_CEILING = 8192;
 const MIN_OUTPUT = 32;
@@ -60,7 +66,8 @@ export async function ask(market: Market, input: AskInput): Promise<Answer> {
   if (!all.length)
     throw new AskError(`No approved Routstr node sells "${input.model}". Use find_models to see the exact model ids.`);
 
-  const keys = new Map(readWallet().keys.map((k) => [k.node, k] as const));
+  const keys = new Map<string, Key>();
+  for (const k of readWallet().keys) if (!keys.has(k.node)) keys.set(k.node, k);
   const payable = all.filter((o) => keys.has(o.node)).sort((a, b) => unitCost(a) - unitCost(b));
   if (!payable.length) {
     const cheapest = [...all].sort((a, b) => unitCost(a) - unitCost(b))[0]!;
@@ -104,7 +111,7 @@ export async function ask(market: Market, input: AskInput): Promise<Answer> {
           }
         }
         // try the next node only when this one never got the request, or refused it without charging
-        if (e.code === "unreachable" || e.status === 402 || e.status >= 500) {
+        if (e.code === "unreachable" || [401, 402, 404, 429].includes(e.status) || e.status >= 500) {
           problems.push(e.status === 0 ? e.message : `${host(offer.node)}: ${e.status === 402 ? "not enough sats left on this node" : e.message}`);
           break;
         }

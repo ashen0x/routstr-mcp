@@ -1,7 +1,7 @@
 // End to end on a real local stack: two routstr-core nodes, one nutshell mint with fake
 // Lightning, a fake AI. Run with KIT_CORE_DIR=<routstr-core checkout with .venv> npm run test:e2e
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { sats } from "../../src/format.js";
-import { startCore, startMint, startUpstream, type Service, type Upstream } from "./stack.js";
+import { startCore, startMint, startMintProxy, startUpstream, type Service, type Upstream } from "./stack.js";
 
 const coreDir = process.env.KIT_CORE_DIR;
 const skip = coreDir ? false : "set KIT_CORE_DIR to a routstr-core checkout with its .venv";
@@ -19,6 +19,7 @@ const SECRET = /sk-[A-Za-z0-9]|lnbc|lntb|lnbcrt|cashu[AB]/;
 
 let upstream: Upstream;
 let mint: Service;
+let mintProxy: Awaited<ReturnType<typeof startMintProxy>>;
 let nodeA: Service;
 let nodeB: Service;
 let client: Client;
@@ -38,8 +39,9 @@ before(async () => {
   if (skip) return;
   upstream = await startUpstream();
   mint = await startMint(path.join(run, "mint"));
+  mintProxy = await startMintProxy(mint.url);
   [nodeA, nodeB] = await Promise.all([
-    startCore(coreDir!, path.join(run, "node-a"), mint.url, upstream.url),
+    startCore(coreDir!, path.join(run, "node-a"), mintProxy.url, upstream.url),
     startCore(coreDir!, path.join(run, "node-b"), mint.url, upstream.url),
   ]);
   process.env.ROUTSTR_MCP_HOME = path.join(run, "home");
@@ -56,6 +58,7 @@ after(async () => {
   await client?.close();
   await Promise.all([nodeA?.stop(), nodeB?.stop(), mint?.stop()]);
   await upstream?.close();
+  await mintProxy?.close();
 });
 
 test("an empty wallet tells the agent how the user adds sats", { skip }, async () => {
@@ -79,6 +82,19 @@ test("paying an invoice opens a key, and a second payment tops the same key up",
   const { text } = await tool("balance");
   assert.match(text, /800 sats on 1 node/);
   assert.equal(wallet.readWallet().keys.length, 1);
+  assert.equal(wallet.readWallet().pending.length, 0);
+});
+
+test("an invoice paid after core calls it expired still lands in the wallet", { skip }, async () => {
+  mintProxy.hidePayments(true);
+  const late = await wallet.createInvoice(nodeA.url, 100);
+  // core marks invoices expired by the clock after an hour, but credits a late payment for a day more
+  execFileSync("python3", ["-I", "-c", "import sqlite3,sys;c=sqlite3.connect(sys.argv[1]);c.execute('UPDATE lightning_invoices SET expires_at=? WHERE id=?',(int(sys.argv[2]),sys.argv[3]));c.commit()",
+    path.join(run, "node-a", "core.db"), String(Math.floor(Date.now() / 1000) - 5), late.invoiceId]);
+  assert.equal(await wallet.settleInvoice(late), "expired");
+  assert.equal(wallet.readWallet().pending.length, 1, "kept, because a payment can still land");
+  mintProxy.hidePayments(false);
+  assert.match((await tool("balance")).text, /900 sats on 1 node/);
   assert.equal(wallet.readWallet().pending.length, 0);
 });
 
