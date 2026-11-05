@@ -165,9 +165,12 @@ export async function settleInvoice(pending: Pending): Promise<InvoiceState> {
   return body?.status === "expired" ? "expired" : "waiting";
 }
 
-/** Picks up invoices paid since the last look, e.g. after a fund command was stopped. */
+/** Picks up invoices paid since the last look, e.g. after a fund command was stopped. Expired ones are checked without waiting. */
 export async function settleAll(): Promise<void> {
-  await Promise.allSettled(readWallet().pending.map(settleInvoice));
+  const now = Date.now() / 1000;
+  const pending = readWallet().pending;
+  for (const p of pending.filter((p) => p.expiresAt <= now)) settleInvoice(p).catch(() => {});
+  await Promise.allSettled(pending.filter((p) => p.expiresAt > now).map(settleInvoice));
 }
 
 export interface Balance {
