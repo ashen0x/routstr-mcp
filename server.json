@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.ashen0x/routstr-mcp",
+  "title": "Routstr",
+  "description": "Any model sold on Routstr as a tool or subagent, paid in sats from a prepaid key",
+  "repository": {
+    "url": "https://github.com/ashen0x/routstr-mcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "routstr-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

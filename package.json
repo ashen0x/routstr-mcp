@@ -3,6 +3,15 @@
   "version": "0.1.0",
   "description": "Any of Routstr's AI models as a tool for your agent, paid in sats from a prepaid key that cannot overspend",
   "license": "MIT",
+  "mcpName": "io.github.ashen0x/routstr-mcp",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ashen0x/routstr-mcp.git"
+  },
+  "homepage": "https://github.com/ashen0x/routstr-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/ashen0x/routstr-mcp/issues"
+  },
   "type": "module",
   "bin": {
     "routstr-mcp": "dist/src/index.js"
