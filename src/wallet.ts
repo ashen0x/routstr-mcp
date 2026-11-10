@@ -141,14 +141,7 @@ const dropPending = (invoiceId: string) =>
 /** Checks one invoice and moves a paid one into the wallet. Safe to repeat. */
 export async function settleInvoice(pending: Pending): Promise<InvoiceState> {
   const pastGrace = Date.now() / 1000 > pending.expiresAt + CREDIT_GRACE_S;
-  let body: { status?: string; api_key?: string | null } | undefined;
-  try {
-    ({ body } = await request<typeof body>(pending.node, `/lightning/invoice/${encodeURIComponent(pending.invoiceId)}/status`, { timeoutMs: 5000 }));
-  } catch (e) {
-    if (!pastGrace) throw e;
-    await dropPending(pending.invoiceId);
-    return "expired";
-  }
+  const { body } = await request<{ status?: string; api_key?: string | null } | undefined>(pending.node, `/lightning/invoice/${encodeURIComponent(pending.invoiceId)}/status`, { timeoutMs: 5000 });
   const key = body?.api_key ?? pending.key;
   if (body?.status === "paid" && key) {
     await updateWallet((wallet) => {
