@@ -77,6 +77,9 @@ function run(cmd: string, args: string[], cwd: string, timeoutMs = 20_000): Prom
   });
 }
 
+/** Patches in the one shape filterPatch reads, whatever the user's git config says about prefixes, colors or diff tools. */
+const PATCH_FLAGS = ["--no-ext-diff", "--no-textconv", "--no-color", "--src-prefix=a/", "--dst-prefix=b/"];
+
 let ripgrep: Promise<boolean> | undefined;
 const hasRipgrep = () => (ripgrep ??= run("rg", ["--version"], os.tmpdir(), 5000).then((r) => r.code === 0));
 
@@ -353,18 +356,19 @@ export class Workspace {
 
   private async runGit(args: string[]): Promise<string> {
     const root = this.roots[0]!;
-    const r = await run("git", ["--no-pager", "-c", "core.fsmonitor=false", "-c", "core.quotepath=off", "-c", "color.ui=never", ...args], root);
+    const r = await run("git", ["--no-pager", "-c", "core.fsmonitor=false", "-c", "core.quotepath=off", "-c", "color.ui=never", "-c", "color.diff=never", "-c", "color.status=never", ...args], root);
     if (r.code !== 0) throw new WorkspaceError(`git failed: ${r.err.trim().slice(0, 300) || `exit ${r.code}`}`);
     return r.out;
   }
 
-  /** Drops the parts of a patch that touch secret files. */
+  /** Drops the parts of a patch that touch secret files, and any part whose file it cannot tell. */
   private filterPatch(patch: string): string {
     return patch
-      .split(/(?=^diff --git )/m)
+      .split(/(?=^diff --)/m)
       .filter((part) => {
+        if (!part.startsWith("diff --")) return true;
         const m = part.match(/^diff --git a\/(.+?) b\/(.+)$/m);
-        return !m || (!isSecretPath(m[1]!) && !isSecretPath(m[2]!));
+        return !!m && !isSecretPath(m[1]!) && !isSecretPath(m[2]!);
       })
       .join("");
   }
@@ -381,7 +385,7 @@ export class Workspace {
           .join("\n");
         break;
       case "diff":
-        out = this.filterPatch(await this.runGit(["diff", "--no-ext-diff", "--no-textconv", "--stat", "--patch", ...(opts.staged ? ["--staged"] : []), ...(opts.ref ? [checkRef(opts.ref)] : []), "--", ...(file ? [file] : [])])) || "No changes.";
+        out = this.filterPatch(await this.runGit(["diff", ...PATCH_FLAGS, "--stat", "--patch", ...(opts.staged ? ["--staged"] : []), ...(opts.ref ? [checkRef(opts.ref)] : []), "--", ...(file ? [file] : [])])) || "No changes.";
         break;
       case "log":
         out = await this.runGit(["log", `--max-count=${Math.min(Math.max(1, opts.limit ?? 20), 100)}`, "--date=short", "--format=%h %ad %an: %s", ...(opts.ref ? [checkRef(opts.ref)] : []), "--", ...(file ? [file] : [])]) || "No commits.";
@@ -390,7 +394,7 @@ export class Workspace {
         if (!opts.ref) throw new WorkspaceError("show needs a ref, such as HEAD or a commit hash.");
         out = file
           ? await this.runGit(["show", `${checkRef(opts.ref)}:${file === "." ? "" : file}`])
-          : this.filterPatch(await this.runGit(["show", "--no-ext-diff", "--no-textconv", "--stat", "--patch", checkRef(opts.ref)]));
+          : this.filterPatch(await this.runGit(["show", ...PATCH_FLAGS, "--stat", "--patch", checkRef(opts.ref)]));
         break;
       default:
         throw new WorkspaceError(`git ${command} is not available; use status, diff, log or show.`);

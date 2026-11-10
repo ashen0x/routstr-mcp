@@ -88,6 +88,16 @@ test("glob, grep and git", async () => {
   const diff = await ws.git("diff");
   assert.match(diff, /\+export const d = 4;/);
   assert.doesNotMatch(diff, /MORE=1/);
+  // a user's git config must not change the patch shape the secret filter reads
+  const hostile = { diff_mnemonicPrefix: "true", diff_noprefix: "true", color_diff: "always", color_ui: "always" };
+  Object.assign(process.env, { GIT_CONFIG_COUNT: "4" }, ...Object.entries(hostile).map(([k, v], i) => ({ [`GIT_CONFIG_KEY_${i}`]: k.replace("_", "."), [`GIT_CONFIG_VALUE_${i}`]: v })));
+  try {
+    const shaped = await ws.git("diff");
+    assert.match(shaped, /\+export const d = 4;/);
+    assert.doesNotMatch(shaped, /MORE=1/);
+  } finally {
+    for (const k of Object.keys(process.env)) if (k.startsWith("GIT_CONFIG_")) delete process.env[k];
+  }
   assert.match(await ws.git("log"), /start/);
   await assert.rejects(ws.git("show", { ref: "--output=/tmp/x" }), WorkspaceError);
   await assert.rejects(ws.git("push"), /not available/);
