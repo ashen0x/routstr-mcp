@@ -115,6 +115,14 @@ export async function createInvoice(nodeUrl: string, sats: number): Promise<Pend
     key: existing?.key,
     body: JSON.stringify({ amount_sats: sats, purpose: existing ? "topup" : "create" }),
   });
+  const now = Date.now() / 1000;
+  if (
+    typeof body?.invoice_id !== "string" || !body.invoice_id || body.invoice_id.length > 200 ||
+    typeof body.bolt11 !== "string" || !/^ln[a-z0-9]{20,}$/i.test(body.bolt11) ||
+    body.amount_sats !== sats ||
+    !Number.isFinite(body.expires_at) || body.expires_at < now || body.expires_at > now + 7 * 86_400
+  )
+    throw new Error(`${new URL(node).host} sent an invoice reply that does not look right, so it was not used.`);
   const pending: Pending = {
     node,
     invoiceId: body.invoice_id,

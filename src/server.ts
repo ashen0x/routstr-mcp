@@ -27,6 +27,7 @@ function redactor(): (value: string) => string {
     return (value) => value;
   }
   const needles = secrets
+    .filter((secret): secret is string => typeof secret === "string")
     .flatMap((secret) => [secret, secret.replace(/^sk-/, "")])
     .filter((secret) => secret.length >= 16);
   return (value) => needles.reduce((out, secret) => out.split(secret).join("[secret removed]"), value);
