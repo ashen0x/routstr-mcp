@@ -109,7 +109,7 @@ test("unifiedDiff marks a missing final newline", () => {
 
 // ---- the delegate tool against a scripted node ----
 
-type Script = (body: { messages: { role: string; content: unknown; tool_calls?: unknown[]; reasoning_content?: string }[]; tools?: unknown[]; tool_choice?: string; max_tokens: number }) => { status?: number; message?: Record<string, unknown>; costMsats?: number; delayMs?: number };
+type Script = (body: { messages: { role: string; content: unknown; tool_calls?: unknown[]; reasoning_content?: string }[]; tools?: unknown[]; tool_choice?: string; max_tokens: number }) => { status?: number; message?: Record<string, unknown>; costMsats?: number; delayMs?: number; usage?: { prompt_tokens: number; completion_tokens: number } };
 
 let script: Script = () => ({ message: { content: "done" } });
 const seen: Parameters<Script>[0][] = [];
@@ -138,7 +138,7 @@ before(async () => {
         return res.end(JSON.stringify({ detail: "tools are not supported by this model" }));
       }
       res.setHeader("x-routstr-cost-msats", String(reply.costMsats ?? 2000));
-      res.end(JSON.stringify({ choices: [{ message: { role: "assistant", ...reply.message }, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 5 } }));
+      res.end(JSON.stringify({ choices: [{ message: { role: "assistant", ...reply.message }, finish_reason: "stop" }], usage: reply.usage ?? { prompt_tokens: 10, completion_tokens: 5 } }));
     } else {
       res.statusCode = 404;
       res.end("{}");
@@ -218,6 +218,24 @@ test("the run stops at its budget and its step limit, and asks for a report firs
   const steps = await delegate({ task: "loop", model: "worker", max_steps: 2 });
   assert.match(steps.text, /stopped: step limit\nReport after 2 steps\./);
   assert.equal(seen.length, 3);
+});
+
+test("a node that bills more than its listed price cannot push the run past its budget", async () => {
+  makeProject();
+  fs.writeFileSync(path.join(project, "big.txt"), `${"x".repeat(60)}\n`.repeat(600));
+  seen.length = 0;
+  // input billed at 8 times the listed 0.0001 sats a token, as a GLM-5.3 route did on 11-10
+  script = (body) => {
+    const usage = { prompt_tokens: Math.ceil(JSON.stringify(body).length / 3), completion_tokens: 50 };
+    const costMsats = Math.round(1000 * (usage.prompt_tokens * 0.0008 + usage.completion_tokens * 0.0002));
+    return body.tool_choice === "none"
+      ? { message: { content: "Report: read big.txt." }, costMsats, usage }
+      : { message: { content: null, tool_calls: [toolCall(`b${seen.length}`, "read", { path: "big.txt" })] }, costMsats, usage };
+  };
+  const { text } = await delegate({ task: "read big.txt again and again", model: "worker", max_sats: 100 });
+  assert.ok(Number(text.match(/· ([\d.]+) of 100 sats/)![1]) <= 100, text);
+  assert.match(text, /stopped: budget used\nReport: read big\.txt\./);
+  assert.match(text, /billed about (7\.9|8\.0) times its listed price/);
 });
 
 test("several models at once only read, and edit access writes", async () => {

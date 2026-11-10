@@ -77,6 +77,8 @@ export interface Answer {
 export interface Reply extends Answer {
   /** the assistant message as the node sent it, to send back on the next turn */
   message: Message;
+  /** what the catalog price says the reported tokens cost, when the node settled the call */
+  listedSats?: number;
 }
 
 export interface AskInput {
@@ -104,7 +106,19 @@ export interface ChatInput {
   signal?: AbortSignal;
   /** shown in the spend log */
   purpose: string;
+  /** how many times its listed price the node has really billed this model, so the call is sized on what it costs */
+  priceFactor?: number;
 }
+
+/** An offer at what the node really bills, when that is more than it lists. */
+const priced = (offer: Offer, factor = 1): Offer =>
+  factor <= 1 ? offer : {
+    ...offer,
+    promptRate: offer.promptRate * factor,
+    completionRate: offer.completionRate * factor,
+    ...(offer.requestRate !== undefined ? { requestRate: offer.requestRate * factor } : {}),
+    ...(offer.imageRate !== undefined ? { imageRate: offer.imageRate * factor } : {}),
+  };
 
 function answerText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -220,7 +234,8 @@ export async function chat(market: Market, input: ChatInput): Promise<Reply> {
   const cap = Math.min(input.maxSats, today);
   const problems: string[] = [];
 
-  for (const offer of payable) {
+  for (const listed of payable) {
+    const offer = priced(listed, input.priceFactor);
     const key = keys.get(offer.node)!;
     let budget = cap;
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -238,6 +253,9 @@ export async function chat(market: Market, input: ChatInput): Promise<Reply> {
       const release = hold(budget);
       try {
         const reply = await complete(offer, key, input, maxTokens, promptTokens, images);
+        const r = reply.receipt;
+        if ((r.costSource === "node_header" || r.costSource === "node_body") && r.inputTokens !== undefined && r.outputTokens !== undefined)
+          reply.listedSats = estimateCost(listed, r.inputTokens, r.outputTokens);
         logSpend({ model: offer.id, node: offer.node, sats: reply.receipt.costSats ?? estimateCost(offer, promptTokens, maxTokens, images), purpose: input.purpose, unsure: reply.receipt.costSats === undefined || undefined });
         return reply;
       } catch (e) {

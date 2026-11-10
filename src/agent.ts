@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
-import { AskError, chat, type Message, type ToolCall, type ToolSpec } from "./calls.js";
+import { AskError, chat, promptSize, type Message, type ToolCall, type ToolSpec } from "./calls.js";
 import { config } from "./config.js";
 import { host, sats } from "./format.js";
 import type { Market } from "./market.js";
@@ -27,6 +27,8 @@ export interface AgentRun {
   reasoningEffort?: ReasoningEffort;
   steps: number;
   spentSats: number;
+  /** settled steps: what the node billed, and what its listed price said, to learn its real price */
+  billed: { paid: number; listed: number };
   commands: Command[];
   lastUsed: number;
   busy: boolean;
@@ -43,6 +45,8 @@ export interface AgentResult {
   budgetSats: number;
   steps: number;
   leftSats?: number;
+  /** how many times its listed price the node billed */
+  priceFactor: number;
 }
 
 export interface AgentInput {
@@ -244,9 +248,12 @@ async function loop(market: Market, run: AgentRun, input: AgentInput): Promise<A
         break;
       }
       const left = input.maxSats - cost;
-      // the next step resends everything, so it costs at least what the last one did
-      const lastStep = receipts.at(-1)?.costSats ?? 0;
-      if (!wrapUp && (steps >= input.maxSteps || left < Math.max(input.maxSats * 0.1, lastStep * 2))) {
+      trimHistory(run.messages);
+      // the next step resends everything, so it costs what the last one did, grown with the conversation;
+      // the report needs as much again, so the run wraps up while both still fit
+      const last = receipts.at(-1);
+      const next = last ? (last.costSats ?? last.estimatedMaxSats) * Math.max(1, promptSize(run.messages, tools).tokens / Math.max(1, last.estimatedInputTokens)) : 0;
+      if (!wrapUp && (steps >= input.maxSteps || left < Math.max(input.maxSats * 0.1, next * 2))) {
         wrapUp = steps >= input.maxSteps ? "steps" : "budget";
         run.messages.push({ role: "user", content: `You are out of ${wrapUp === "steps" ? "steps" : "budget"}. Do not call any more tools: write your report now from what you found.` });
       }
@@ -254,7 +261,6 @@ async function loop(market: Market, run: AgentRun, input: AgentInput): Promise<A
         stopped = "budget";
         break;
       }
-      trimHistory(run.messages);
       let reply;
       try {
         reply = await chat(market, {
@@ -262,7 +268,9 @@ async function loop(market: Market, run: AgentRun, input: AgentInput): Promise<A
           messages: run.messages,
           tools,
           toolChoice: wrapUp ? "none" : "auto",
-          maxSats: Math.min(left, config.maxSatsPerCall),
+          // a working step leaves half of what is left, so one runaway step cannot take the report's sats
+          maxSats: Math.min(wrapUp ? left : left / 2, config.maxSatsPerCall),
+          priceFactor: factor(run),
           node: run.node,
           reasoningEffort: run.reasoningEffort,
           signal: input.signal,
@@ -293,6 +301,10 @@ async function loop(market: Market, run: AgentRun, input: AgentInput): Promise<A
       cost += spent;
       run.spentSats += spent;
       leftSats = reply.receipt.balanceSats;
+      if (reply.listedSats && reply.receipt.costSats !== undefined) {
+        run.billed.paid += reply.receipt.costSats;
+        run.billed.listed += reply.listedSats;
+      }
       run.messages.push(reply.message);
       const calls = reply.message.tool_calls ?? [];
       if (!calls.length || wrapUp) {
@@ -322,8 +334,11 @@ async function loop(market: Market, run: AgentRun, input: AgentInput): Promise<A
     run.busy = false;
     run.lastUsed = Date.now();
   }
-  return { run, text, stopped, error, receipts, costSats: cost, budgetSats: input.maxSats, steps, leftSats };
+  return { run, text, stopped, error, receipts, costSats: cost, budgetSats: input.maxSats, steps, leftSats, priceFactor: factor(run) };
 }
+
+/** How many times its listed price the node has billed this run, from 1 up to 50. */
+const factor = (run: AgentRun) => (run.billed.listed > 0 ? Math.min(Math.max(run.billed.paid / run.billed.listed, 1), 50) : 1);
 
 export async function startAgent(market: Market, input: NewAgentInput): Promise<AgentResult> {
   const ws = input.workspace;
@@ -350,6 +365,7 @@ export async function startAgent(market: Market, input: NewAgentInput): Promise<
     ],
     steps: 0,
     spentSats: 0,
+    billed: { paid: 0, listed: 0 },
     commands: [],
     lastUsed: Date.now(),
     busy: false,
@@ -400,5 +416,7 @@ export function report(result: AgentResult): string {
     `— ${run.model}${node} · ${result.steps} step${result.steps === 1 ? "" : "s"} · ${sats(result.costSats)} of ${sats(result.budgetSats)} sats${left} · session ${run.id} (pass it as session to follow up within 30 minutes)`
   );
   if (result.receipts.some((r) => r.overTarget)) lines.push("A step cost more than the node's advertised price allowed.");
+  if (result.priceFactor >= 1.5)
+    lines.push(`${run.node ? host(run.node) : "The node"} billed about ${result.priceFactor.toFixed(1)} times its listed price for ${run.model}, so the run was sized on that.`);
   return lines.join("\n");
 }
