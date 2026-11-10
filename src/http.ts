@@ -43,7 +43,9 @@ function readError(body: unknown): ErrorBody {
  * Status 0 with code "unreachable" means no connection was ever made, so the node never saw the request.
  * Once connected, a failure is "lost": the node may have taken the request and charged for it.
  */
-function networkError(node: string, timedOut: boolean, connected: boolean): NodeError {
+function networkError(node: string, timedOut: boolean, connected: boolean, cancelled = false): NodeError {
+  if (cancelled)
+    return new NodeError(node, 0, connected ? `Cancelled after ${new URL(node).host} got the request, so it may still charge for it` : "Cancelled", "cancelled");
   const what = timedOut ? "timed out" : connected ? "dropped the connection" : "is unreachable";
   return new NodeError(node, 0, `${new URL(node).host} ${what}`, connected ? "lost" : "unreachable");
 }
@@ -65,14 +67,15 @@ export interface NodeResponse<T> {
 export async function request<T>(
   node: string,
   path: string,
-  init: { method?: string; body?: string; key?: string; timeoutMs?: number } = {}
+  init: { method?: string; body?: string; key?: string; timeoutMs?: number; signal?: AbortSignal } = {}
 ): Promise<NodeResponse<T>> {
   const { method = "GET", body: payload, key, timeoutMs = 15_000 } = init;
   const url = new URL(`${node}${path}`);
   const headers: Record<string, string> = { Accept: "application/json" };
   if (key) headers.Authorization = `Bearer ${key}`;
   if (payload) headers["Content-Type"] = "application/json";
-  const signal = AbortSignal.timeout(timeoutMs);
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const signal = init.signal ? AbortSignal.any([timeout, init.signal]) : timeout;
   let connected = false;
 
   const res = await new Promise<http.IncomingMessage>((resolve, reject) => {
@@ -84,7 +87,7 @@ export async function request<T>(
     req.once("error", reject);
     req.end(payload);
   }).catch(() => {
-    throw networkError(node, signal.aborted, connected);
+    throw networkError(node, timeout.aborted, connected, init.signal?.aborted);
   });
 
   const chunks: Buffer[] = [];
@@ -100,7 +103,7 @@ export async function request<T>(
     }
   } catch (e) {
     if (e instanceof NodeError) throw e;
-    throw networkError(node, signal.aborted, true);
+    throw networkError(node, timeout.aborted, true, init.signal?.aborted);
   }
 
   const text = Buffer.concat(chunks).toString("utf8");

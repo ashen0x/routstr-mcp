@@ -33,4 +33,8 @@ export const config = {
   defaultSatsPerCall: Math.min(number(process.env.ROUTSTR_SATS_PER_CALL, 100), maxSatsPerCall),
   /** Largest spend target the agent may request. */
   maxSatsPerCall,
+  /** The most all calls together may cost in one day; unset means no daily limit beyond the prepaid balance. */
+  dailySats: number(process.env.ROUTSTR_DAILY_SATS, 0) || undefined,
+  /** Folders file attachments may be read from, when the MCP app does not say which folder is open. */
+  workspace: list(process.env.ROUTSTR_WORKSPACE),
 };

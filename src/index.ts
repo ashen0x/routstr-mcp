@@ -4,7 +4,9 @@ import { parseArgs } from "node:util";
 import qrcode from "qrcode-terminal";
 import { host, sats, version } from "./format.js";
 import { Market, normalizeNode, offersFor, unitCost } from "./market.js";
+import { config } from "./config.js";
 import { balanceReport, serve } from "./server.js";
+import { readSpend, startOfToday } from "./spend.js";
 import { balanceOf, createInvoice, importKey, keyFor, readWallet, refundFile, refundKey, settleInvoice } from "./wallet.js";
 
 const USAGE = `routstr-mcp ${version}: Routstr models as tools for your agent, paid in sats.
@@ -17,6 +19,8 @@ const USAGE = `routstr-mcp ${version}: Routstr models as tools for your agent, p
   routstr-mcp refund                  take all unspent sats back as a Cashu token
       --to <lightning address>        or send them to a Lightning address
       --node <url>                    only from this node
+  routstr-mcp spend                   what calls cost: today, per day and per model
+      --days <n>                      look back this many days (default 7)
   routstr-mcp nodes                   approved nodes and how many models each sells
   routstr-mcp import --node <url>     add a Routstr key you already have (read from stdin)
 
@@ -99,6 +103,32 @@ async function refund(to?: string, node?: string) {
   }
 }
 
+function spend(daysArg?: string) {
+  const days = Math.min(Math.max(Math.floor(Number(daysArg ?? 7)) || 7, 1), 365);
+  const since = startOfToday() - (days - 1) * 86_400_000;
+  const entries = readSpend(since);
+  const today = entries.filter((e) => Date.parse(e.at) >= startOfToday());
+  const sum = (list: typeof entries) => list.reduce((total, e) => total + e.sats, 0);
+  const limit = config.dailySats ? ` of a ${sats(config.dailySats)} sat daily limit` : "";
+  console.log(`Today: ${sats(sum(today))} sats in ${today.length} call${today.length === 1 ? "" : "s"}${limit}.`);
+  if (!entries.length) return;
+  const byDay = new Map<string, typeof entries>();
+  const byModel = new Map<string, typeof entries>();
+  for (const e of entries) {
+    const day = new Date(e.at).toLocaleDateString("en-CA");
+    byDay.set(day, [...(byDay.get(day) ?? []), e]);
+    byModel.set(e.model, [...(byModel.get(e.model) ?? []), e]);
+  }
+  console.log(`\nLast ${days} day${days === 1 ? "" : "s"}: ${sats(sum(entries))} sats`);
+  for (const [day, list] of [...byDay].sort()) console.log(`  ${day}  ${sats(sum(list)).padStart(9)} sats  ${list.length} calls`);
+  console.log("\nBy model:");
+  for (const [model, list] of [...byModel].sort((a, b) => sum(b[1]) - sum(a[1]))) console.log(`  ${sats(sum(list)).padStart(9)} sats  ${model} (${list.length})`);
+  console.log("\nLatest:");
+  for (const e of entries.slice(-10))
+    console.log(`  ${e.at.slice(0, 16).replace("T", " ")}  ${clean(e.model)} on ${host(e.node)}  ${e.unsure ? "up to " : ""}${sats(e.sats)} sats  (${e.purpose})`);
+  if (entries.some((e) => e.unsure)) console.log("\n\"up to\" marks a call that was lost after the node got it, counted at its cap.");
+}
+
 async function nodes() {
   const { offers, reached, missed } = await new Market().load(true);
   for (const node of reached)
@@ -128,6 +158,7 @@ async function main() {
       node: { type: "string" },
       model: { type: "string" },
       to: { type: "string" },
+      days: { type: "string" },
       help: { type: "boolean", short: "h" },
       version: { type: "boolean", short: "v" },
     },
@@ -147,6 +178,8 @@ async function main() {
       return refund(values.to, values.node);
     case "nodes":
       return nodes();
+    case "spend":
+      return spend(values.days);
     case "import": {
       if (!values.node) throw new Error("Say which node the key belongs to: routstr-mcp import --node <url>");
       const balance = await importKey(values.node, await readSecret("Paste the sk- key (hidden): "));

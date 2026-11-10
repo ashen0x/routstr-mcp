@@ -15,6 +15,14 @@ export interface Offer {
   maxOutput?: number;
   promptRate: number;
   completionRate: number;
+  /** takes images as input */
+  vision?: boolean;
+  /** sats per input image, on top of its tokens */
+  imageRate?: number;
+  /** sats per request, on top of the tokens */
+  requestRate?: number;
+  /** also bills web searches or reasoning by use, which no estimate can bound */
+  extraFees?: boolean;
 }
 
 const POSITIVE = new Set(["trusted", "verified", "lgtm", "lgtm2"]);
@@ -199,9 +207,9 @@ interface RawModel {
   alias_ids?: string[] | null;
   context_length?: number;
   enabled?: boolean;
-  architecture?: { output_modalities?: string[] };
+  architecture?: { input_modalities?: string[]; output_modalities?: string[] };
   top_provider?: { context_length?: number | null; max_completion_tokens?: number | null } | null;
-  sats_pricing?: { prompt?: number; completion?: number } | null;
+  sats_pricing?: { prompt?: number; completion?: number; image?: number; request?: number; web_search?: number; internal_reasoning?: number } | null;
 }
 
 const count = (value: unknown) => (Number.isSafeInteger(value) && (value as number) > 0 ? (value as number) : undefined);
@@ -227,6 +235,10 @@ export function parseOffers(node: string, models: unknown): Offer[] {
       maxOutput: count(m.top_provider?.max_completion_tokens),
       promptRate: m.sats_pricing!.prompt!,
       completionRate: m.sats_pricing!.completion!,
+      vision: Array.isArray(m.architecture?.input_modalities) && m.architecture.input_modalities.includes("image"),
+      imageRate: rate(m.sats_pricing?.image) ? m.sats_pricing!.image! : 0,
+      requestRate: rate(m.sats_pricing?.request) ? m.sats_pricing!.request! : 0,
+      extraFees: rate(m.sats_pricing?.web_search) || rate(m.sats_pricing?.internal_reasoning),
     }));
 }
 
@@ -313,4 +325,4 @@ export function searchModels(offers: Offer[], query = ""): ModelSummary[] {
 }
 
 /** The cost of a typical tool call (2,000 tokens in, 1,000 out), used to rank nodes and models. */
-export const unitCost = (offer: Offer) => 2000 * offer.promptRate + 1000 * offer.completionRate;
+export const unitCost = (offer: Offer) => (offer.requestRate ?? 0) + 2000 * offer.promptRate + 1000 * offer.completionRate;

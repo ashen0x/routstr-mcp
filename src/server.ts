@@ -1,19 +1,25 @@
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { ask, council, quote } from "./calls.js";
+import { ask, AskError, council, quote, type ContentPart } from "./calls.js";
 import { config } from "./config.js";
 import { host, perMillion, sats, tokens, version } from "./format.js";
 import { Market, searchModels, unitCost } from "./market.js";
 import { reasoningEffortSchema, receiptSchema, type CostReceipt } from "./receipt.js";
+import { spentToday } from "./spend.js";
 import { balances, readWallet } from "./wallet.js";
+import { usableRoot, Workspace, WorkspaceError } from "./workspace.js";
+
+/** Where the MCP app started this server: the project folder for most apps. */
+const STARTED_IN = process.cwd();
 
 const FUND_HINT =
   "To add sats, the user runs `npx routstr-mcp fund <sats>` in a terminal and pays the Lightning invoice it shows. " +
   "`npx routstr-mcp refund` takes unspent sats back.";
 
 const INSTRUCTIONS = `routstr-mcp lets you call AI models sold on Routstr, an open market of nodes paid in bitcoin, as tools.
-Use it for a second opinion from a different model, to compare several models with council, or to hand a simple sub-task to a cheaper model.
+Use ask for a second opinion from a different model, and council to compare several models.
 Paid calls draw from the user's prepaid Routstr balance and return cost receipts. Use quote to estimate a specific prompt before spending.
 Use find_models when you are unsure of a model id. Never ask the user for API keys, Cashu tokens or invoices. ${FUND_HINT}`;
 
@@ -56,6 +62,33 @@ function footer(receipt: CostReceipt): string {
 const nodePin = z.string().trim().min(1).optional().describe("Pin a listed Routstr node by its base URL, as returned by quote.");
 const reasoningEffort = reasoningEffortSchema.optional().describe("Request a reasoning effort. The serving route determines support and behavior.");
 
+const filesInput = z.array(z.string().min(1)).max(20).optional().describe("Project files to send along, relative to the project root. Secret files (.env, keys) are refused.");
+const imagesInput = z.array(z.string().min(1)).max(4).optional().describe("Images for a vision model: project file paths (PNG, JPEG, GIF, WebP up to 1 MB) or https URLs.");
+
+interface Extra {
+  signal: AbortSignal;
+  _meta?: { progressToken?: string | number };
+  sendNotification: (n: { method: "notifications/progress"; params: { progressToken: string | number; progress: number; total?: number; message?: string } }) => Promise<void>;
+}
+
+/** Progress notes for the MCP app; they also keep apps that reset their timeout on progress from giving up. */
+function progress(extra: Extra) {
+  const token = extra._meta?.progressToken;
+  let count = 0;
+  return (message: string) => {
+    if (token === undefined) return;
+    extra.sendNotification({ method: "notifications/progress", params: { progressToken: token, progress: ++count, message } }).catch(() => {});
+  };
+}
+
+/** A note every 15 seconds while a single slow call runs. */
+function heartbeat(extra: Extra, what: string): () => void {
+  const note = progress(extra);
+  const started = Date.now();
+  const timer = setInterval(() => note(`waiting for ${what} · ${Math.round((Date.now() - started) / 1000)} s`), 15_000);
+  return () => clearInterval(timer);
+}
+
 const maxSats = z
   .number()
   .positive()
@@ -67,6 +100,8 @@ const askInput = {
   model: z.string().min(1).describe("Model id, e.g. from find_models"),
   prompt: z.string().min(1).describe("The full question, with all context the model needs"),
   system: z.string().optional().describe("Optional system prompt"),
+  files: filesInput,
+  images: imagesInput,
   max_sats: maxSats,
   node: nodePin,
   reasoning_effort: reasoningEffort,
@@ -92,6 +127,37 @@ const quoteSchema = receiptSchema.pick({
 export function createServer(market = new Market()): McpServer {
   const server = new McpServer({ name: "routstr", version }, { instructions: INSTRUCTIONS });
 
+  /** The project folders the MCP app has open, or ROUTSTR_WORKSPACE, or the folder the app started us in. */
+  const projectRoots = async (): Promise<string[]> => {
+    let dirs: string[] = [];
+    if (server.server.getClientCapabilities()?.roots) {
+      try {
+        const { roots } = await server.server.listRoots(undefined, { timeout: 5000 });
+        dirs = roots.filter((r) => r.uri.startsWith("file://")).map((r) => fileURLToPath(r.uri));
+      } catch {
+        /* the app said it has roots but did not answer */
+      }
+    }
+    if (!dirs.length) dirs = config.workspace ?? [STARTED_IN];
+    const usable = [...new Set(dirs.map(usableRoot).filter((d): d is string => !!d))];
+    if (!usable.length)
+      throw new WorkspaceError("No project folder is open (the app started this server in the home folder or at the disk root). Set ROUTSTR_WORKSPACE to the project folder.");
+    return usable;
+  };
+
+  const attachments = async (files?: string[], images?: string[]): Promise<ContentPart[] | undefined> => {
+    if (!files?.length && !images?.length) return undefined;
+    const local = (files?.length || images?.some((i) => !/^https:\/\//i.test(i))) ? new Workspace(await projectRoots()) : undefined;
+    const parts: ContentPart[] = [];
+    for (const file of files ?? []) {
+      const { name, text } = local!.attach(file);
+      parts.push({ type: "text", text: `<file path="${name}">\n${text}\n</file>` });
+    }
+    for (const image of images ?? [])
+      parts.push({ type: "image_url", image_url: { url: /^https:\/\//i.test(image) ? image : local!.image(image) } });
+    return parts;
+  };
+
   server.registerTool(
     "quote",
     {
@@ -101,10 +167,11 @@ export function createServer(market = new Market()): McpServer {
       outputSchema: { quote: quoteSchema },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
-    async ({ model, prompt, system, max_sats, node, reasoning_effort }) => {
+    async ({ model, prompt, system, files, images, max_sats, node, reasoning_effort }) => {
       try {
         const q = await quote(market, {
           model, prompt, system, node, reasoningEffort: reasoning_effort, maxSats: max_sats ?? config.defaultSatsPerCall,
+          attachments: await attachments(files, images),
         });
         const cost = q.estimatedMaxSats === undefined
           ? `Target too low for the minimum output. Estimated minimum: ${sats(q.minimumSats)} sats.`
@@ -133,14 +200,18 @@ export function createServer(market = new Market()): McpServer {
       outputSchema: { receipt: receiptSchema },
       annotations: { readOnlyHint: false, openWorldHint: true },
     },
-    async ({ model, prompt, system, max_sats, node, reasoning_effort }) => {
+    async ({ model, prompt, system, files, images, max_sats, node, reasoning_effort }, extra) => {
+      const stop = heartbeat(extra as Extra, model);
       try {
         const { text: answer, receipt } = await ask(market, {
           model, prompt, system, node, reasoningEffort: reasoning_effort, maxSats: max_sats ?? config.defaultSatsPerCall,
+          attachments: await attachments(files, images), signal: extra.signal,
         });
         return text(`${answer || "(the model returned no text)"}\n\n— ${footer(receipt)}`, false, { receipt });
       } catch (e) {
         return text((e as Error).message, true);
+      } finally {
+        stop();
       }
     }
   );
@@ -156,6 +227,8 @@ export function createServer(market = new Market()): McpServer {
         models: z.array(z.string().min(1)).min(2).max(5).describe("Model ids"),
         prompt: z.string().min(1).describe("The full question, with all context the models need"),
         system: z.string().optional().describe("Optional system prompt"),
+        files: filesInput,
+        images: imagesInput,
         max_sats_each: maxSats,
         node: nodePin,
         reasoning_effort: reasoningEffort,
@@ -170,14 +243,23 @@ export function createServer(market = new Market()): McpServer {
       },
       annotations: { readOnlyHint: false, openWorldHint: true },
     },
-    async ({ models, prompt, system, max_sats_each, node, reasoning_effort }) => {
+    async ({ models, prompt, system, files, images, max_sats_each, node, reasoning_effort }, extra) => {
+      let parts: ContentPart[] | undefined;
+      try {
+        parts = await attachments(files, images);
+      } catch (e) {
+        return text((e as Error).message, true);
+      }
+      const stop = heartbeat(extra as Extra, models.join(", "));
       const seats = await council(market, models, {
         prompt,
         system,
         node,
+        attachments: parts,
         reasoningEffort: reasoning_effort,
         maxSats: max_sats_each ?? config.defaultSatsPerCall,
-      });
+        signal: extra.signal,
+      }).finally(stop);
       const receipts = seats.flatMap((seat) => "answer" in seat ? [seat.answer.receipt] : []);
       const costs = receipts.flatMap((receipt) => receipt.costSats === undefined ? [] : [receipt.costSats]);
       const totalCostSats = costs.length ? costs.reduce((sum, cost) => sum + cost, 0) : undefined;
@@ -207,27 +289,40 @@ export function createServer(market = new Market()): McpServer {
         "Every word of the query must match, e.g. \"claude\", \"gpt 5\", \"qwen coder\". Empty lists the cheapest.",
       inputSchema: {
         query: z.string().optional().describe("Words to match in the model id or name"),
+        vision: z.boolean().optional().describe("Only models that take images"),
+        max_typical_sats: z.number().positive().optional().describe("Only models whose typical call (2k tokens in, 1k out) costs at most this"),
+        min_context: z.number().int().positive().optional().describe("Only models with at least this many tokens of context"),
+        funded: z.boolean().optional().describe("Only models on a node where the user has sats"),
         limit: z.number().int().positive().max(100).optional().describe("Rows to return (default 20)"),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
-    async ({ query, limit }) => {
+    async ({ query, vision, max_typical_sats, min_context, funded: onlyFunded, limit }) => {
       try {
         const { offers, reached, missed } = await market.load();
         const funded = new Set(readWallet().keys.map((k) => k.node));
-        const rows = searchModels(offers, query);
-        const shown = rows.slice(0, limit ?? 20).map((m) => {
-          // the price ask would pay: the cheapest node with sats on it, else the cheapest node
+        // the price ask would pay: the cheapest node with sats on it, else the cheapest node
+        const priced = searchModels(offers, query).map((m) => {
           const paid = m.offers.filter((o) => funded.has(o.node)).sort((a, b) => unitCost(a) - unitCost(b))[0];
-          const at = paid ?? m.cheapest;
+          return { m, paid, at: paid ?? m.cheapest };
+        });
+        const rows = priced.filter(
+          ({ m, paid, at }) =>
+            (vision === undefined || m.offers.some((o) => !!o.vision) === vision) &&
+            (max_typical_sats === undefined || unitCost(at) <= max_typical_sats) &&
+            (min_context === undefined || (m.context ?? 0) >= min_context) &&
+            (onlyFunded === undefined || !!paid === onlyFunded)
+        );
+        const shown = rows.slice(0, limit ?? 20).map(({ m, paid, at }) => {
           return (
             `${m.id} · ${m.nodes} node${m.nodes > 1 ? "s" : ""} · ${tokens(m.context)} context · ` +
             `${perMillion(at.promptRate)} / ${perMillion(at.completionRate)} · ` +
-            `typical ${sats(unitCost(at))} sats${paid ? ` · funded${at !== m.cheapest && unitCost(m.cheapest) < unitCost(at) ? ` (cheapest elsewhere: typical ${sats(unitCost(m.cheapest))})` : ""}` : ""}`
+            `typical ${sats(unitCost(at))} sats${m.offers.some((o) => o.vision) ? " · vision" : ""}${at.extraFees ? " · plus search or reasoning fees" : ""}` +
+            `${paid ? ` · funded${at !== m.cheapest && unitCost(m.cheapest) < unitCost(at) ? ` (cheapest elsewhere: typical ${sats(unitCost(m.cheapest))})` : ""}` : ""}`
           );
         });
         const head =
-          `${rows.length} model${rows.length === 1 ? "" : "s"}${query ? ` match "${query}"` : ""} on ${reached.length} node${reached.length === 1 ? "" : "s"}` +
+          `${rows.length} model${rows.length === 1 ? "" : "s"}${query ? ` match "${query}"` : ""}${rows.length < priced.length ? " and the filters" : ""} on ${reached.length} node${reached.length === 1 ? "" : "s"}` +
           `${missed.length ? ` (${missed.length} did not answer)` : ""}. ` +
           "Prices are sats per 1M tokens in / out where ask would pay: the cheapest node you have sats on, else the cheapest node. typical = 2k tokens in, 1k out; funded = you have sats where it is sold.";
         return text([head, ...shown, rows.length > shown.length ? `…and ${rows.length - shown.length} more.` : ""].filter(Boolean).join("\n"));
@@ -271,6 +366,8 @@ export async function balanceReport(): Promise<string> {
     );
   for (const p of pending)
     lines.push(`- ${Date.now() / 1000 > p.expiresAt ? "expired invoice, still counted if paid late" : "waiting for payment"}: ${sats(p.sats)} sats on ${host(p.node)}`);
+  const today = spentToday();
+  if (today || config.dailySats) lines.push(`Spent today: ${sats(today)} sats${config.dailySats ? ` of a ${sats(config.dailySats)} sat daily limit` : ""}.`);
   lines.push(FUND_HINT);
   return lines.join("\n");
 }
