@@ -209,12 +209,13 @@ const rate = (value: unknown) => typeof value === "number" && Number.isFinite(va
 
 /**
  * Text models a node prices in sats. Zero-priced models are left out: their real price is unknown.
- * Ids with spaces or control characters are dropped too, so a node cannot write its own lines into what the agent reads.
+ * Ids with anything but the characters model ids use are dropped too, so a node cannot write its own lines into what
+ * the agent reads, or shell code into the fund line it hands the user.
  */
 export function parseOffers(node: string, models: unknown): Offer[] {
   return (Array.isArray(models) ? (models as RawModel[]) : [])
     .filter((m) => m && typeof m === "object" && m.enabled !== false)
-    .filter((m) => typeof m.id === "string" && /^[^\s\p{C}]{1,200}$/u.test(m.id))
+    .filter((m) => typeof m.id === "string" && /^~?[\w./:@+-]{1,200}$/.test(m.id))
     .filter((m) => (m.architecture?.output_modalities ?? ["text"]).includes("text"))
     .filter((m) => rate(m.sats_pricing?.prompt) && rate(m.sats_pricing?.completion))
     .map((m) => ({
