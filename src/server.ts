@@ -1,10 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { ask, council, type Answer } from "./calls.js";
+import { ask, council, quote } from "./calls.js";
 import { config } from "./config.js";
 import { host, perMillion, sats, tokens, version } from "./format.js";
 import { Market, searchModels, unitCost } from "./market.js";
+import { reasoningEffortSchema, receiptSchema, type CostReceipt } from "./receipt.js";
 import { balances, readWallet } from "./wallet.js";
 
 const FUND_HINT =
@@ -13,41 +14,112 @@ const FUND_HINT =
 
 const INSTRUCTIONS = `routstr-mcp lets you call AI models sold on Routstr, an open market of nodes paid in bitcoin, as tools.
 Use it for a second opinion from a different model, to compare several models with council, or to hand a simple sub-task to a cheaper model.
-Each call costs a few sats from the user's prepaid Routstr balance and shows the cost. The prepaid balance is a hard limit.
+Paid calls draw from the user's prepaid Routstr balance and return cost receipts. Use quote to estimate a specific prompt before spending.
 Use find_models when you are unsure of a model id. Never ask the user for API keys, Cashu tokens or invoices. ${FUND_HINT}`;
 
 /** The agent never sees a wallet secret, even when a node echoes one back in an answer or an error. */
-function redact(value: string): string {
+function redactor(): (value: string) => string {
   let secrets: string[];
   try {
     const wallet = readWallet();
     secrets = [...wallet.keys.map((k) => k.key), ...wallet.pending.flatMap((p) => [p.bolt11, p.key ?? ""])];
   } catch {
-    return value;
+    return (value) => value;
   }
-  return secrets
+  const needles = secrets
     .flatMap((secret) => [secret, secret.replace(/^sk-/, "")])
-    .filter((secret) => secret.length >= 16)
-    .reduce((out, secret) => out.split(secret).join("[secret removed]"), value);
+    .filter((secret) => secret.length >= 16);
+  return (value) => needles.reduce((out, secret) => out.split(secret).join("[secret removed]"), value);
 }
 
-const text = (value: string, isError = false) => ({ content: [{ type: "text" as const, text: redact(value) }], isError });
+function text(value: string, isError = false, data?: Record<string, unknown>) {
+  const redact = redactor();
+  return {
+    content: [{ type: "text" as const, text: redact(value) }],
+    isError,
+    structuredContent: data === undefined ? undefined : JSON.parse(
+      JSON.stringify(data, (_key, entry) => typeof entry === "string" ? redact(entry) : entry)
+    ) as Record<string, unknown>,
+  };
+}
 
-const footer = (a: Answer) =>
-  `${a.model} on ${host(a.node)} · ${sats(a.costSats)} sats` +
-  (a.leftSats !== undefined ? ` · ${sats(a.leftSats)} sats left there` : "");
+function footer(receipt: CostReceipt): string {
+  const cost = receipt.costSats === undefined ? "cost unavailable"
+    : `${sats(receipt.costSats)} sats${receipt.costSource === "estimate" ? " (estimated)" : ""}`;
+  return `${receipt.model} on ${host(receipt.node)} · ${cost}` +
+    (receipt.balanceSats !== undefined ? ` · ${sats(receipt.balanceSats)} sats left there` : "") +
+    (receipt.overTarget ? `\nThe node charged more than the ${sats(receipt.targetSats)} sat target.` : "") +
+    (receipt.finishReason === "length" ? "\nThe model hit its output token limit." : "");
+}
 
-const cutNote = "The answer reached its sats cap and was cut; ask again with a higher max_sats for a longer one.";
+const nodePin = z.string().trim().min(1).optional().describe("Pin a listed Routstr node by its base URL, as returned by quote.");
+const reasoningEffort = reasoningEffortSchema.optional().describe("Request a reasoning effort. The serving route determines support and behavior.");
 
 const maxSats = z
   .number()
   .positive()
   .max(config.maxSatsPerCall)
   .optional()
-  .describe(`Most this call may cost, in sats (default ${config.defaultSatsPerCall}, at most ${config.maxSatsPerCall}).`);
+  .describe(`Estimated spend target in sats (default ${config.defaultSatsPerCall}, at most ${config.maxSatsPerCall}). The node settles the final charge.`);
+
+const askInput = {
+  model: z.string().min(1).describe("Model id, e.g. from find_models"),
+  prompt: z.string().min(1).describe("The full question, with all context the model needs"),
+  system: z.string().optional().describe("Optional system prompt"),
+  max_sats: maxSats,
+  node: nodePin,
+  reasoning_effort: reasoningEffort,
+};
+
+const quoteSchema = receiptSchema.pick({
+  model: true,
+  node: true,
+  targetSats: true,
+  estimatedInputTokens: true,
+  maxOutputTokens: true,
+  estimatedMaxSats: true,
+  requestedReasoningEffort: true,
+}).extend({
+  estimatedMaxSats: z.number().optional(),
+  minimumSats: z.number(),
+  inputSatsPerToken: z.number(),
+  outputSatsPerToken: z.number(),
+  hasWalletKey: z.boolean(),
+  fitsTarget: z.boolean(),
+});
 
 export function createServer(market = new Market()): McpServer {
   const server = new McpServer({ name: "routstr", version }, { instructions: INSTRUCTIONS });
+
+  server.registerTool(
+    "quote",
+    {
+      title: "Estimate the cost of a Routstr call",
+      description: "Estimate the initial request for this prompt using advertised model prices. No inference is sent.",
+      inputSchema: askInput,
+      outputSchema: { quote: quoteSchema },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ model, prompt, system, max_sats, node, reasoning_effort }) => {
+      try {
+        const q = await quote(market, {
+          model, prompt, system, node, reasoningEffort: reasoning_effort, maxSats: max_sats ?? config.defaultSatsPerCall,
+        });
+        const cost = q.estimatedMaxSats === undefined
+          ? `Target too low for the minimum output. Estimated minimum: ${sats(q.minimumSats)} sats.`
+          : `Estimated at up to ${sats(q.estimatedMaxSats)} sats for ${q.estimatedInputTokens.toLocaleString("en-US")} input tokens and up to ${q.maxOutputTokens.toLocaleString("en-US")} output tokens.`;
+        return text(
+          `${q.model} on ${q.node}\n${cost}\n` +
+          (q.hasWalletKey ? "Wallet key available. " : "No wallet key on this node. ") +
+          "Catalog estimate only. The node settles the final charge.",
+          false,
+          { quote: q }
+        );
+      } catch (e) {
+        return text((e as Error).message, true);
+      }
+    }
+  );
 
   server.registerTool(
     "ask",
@@ -55,19 +127,17 @@ export function createServer(market = new Market()): McpServer {
       title: "Ask a Routstr model",
       description:
         "Ask any model sold on Routstr and get its answer, paid in sats from the user's prepaid balance. " +
-        "Good for a second opinion, a model with different strengths, or a cheap model for a simple job. The cost is shown.",
-      inputSchema: {
-        model: z.string().min(1).describe("Model id, e.g. from find_models"),
-        prompt: z.string().min(1).describe("The full question, with all context the model needs: it sees nothing else"),
-        system: z.string().optional().describe("Optional system prompt"),
-        max_sats: maxSats,
-      },
+        "Returns a cost receipt with the node's charge when available.",
+      inputSchema: askInput,
+      outputSchema: { receipt: receiptSchema },
       annotations: { readOnlyHint: false, openWorldHint: true },
     },
-    async ({ model, prompt, system, max_sats }) => {
+    async ({ model, prompt, system, max_sats, node, reasoning_effort }) => {
       try {
-        const answer = await ask(market, { model, prompt, system, maxSats: max_sats ?? config.defaultSatsPerCall });
-        return text(`${answer.text || "(the model returned no text)"}\n\n— ${footer(answer)}${answer.cut ? `\n${cutNote}` : ""}`);
+        const { text: answer, receipt } = await ask(market, {
+          model, prompt, system, node, reasoningEffort: reasoning_effort, maxSats: max_sats ?? config.defaultSatsPerCall,
+        });
+        return text(`${answer || "(the model returned no text)"}\n\n— ${footer(receipt)}`, false, { receipt });
       } catch (e) {
         return text((e as Error).message, true);
       }
@@ -86,24 +156,44 @@ export function createServer(market = new Market()): McpServer {
         prompt: z.string().min(1).describe("The full question, with all context the models need"),
         system: z.string().optional().describe("Optional system prompt"),
         max_sats_each: maxSats,
+        node: nodePin,
+        reasoning_effort: reasoningEffort,
+      },
+      outputSchema: {
+        seats: z.array(z.union([
+          z.object({ model: z.string(), receipt: receiptSchema }),
+          z.object({ model: z.string(), error: z.string() }),
+        ])),
+        totalCostSats: z.number().optional(),
+        allChargesReported: z.boolean(),
       },
       annotations: { readOnlyHint: false, openWorldHint: true },
     },
-    async ({ models, prompt, system, max_sats_each }) => {
+    async ({ models, prompt, system, max_sats_each, node, reasoning_effort }) => {
       const seats = await council(market, models, {
         prompt,
         system,
+        node,
+        reasoningEffort: reasoning_effort,
         maxSats: max_sats_each ?? config.defaultSatsPerCall,
       });
-      const total = seats.reduce((sum, s) => sum + ("answer" in s ? s.answer.costSats : 0), 0);
+      const receipts = seats.flatMap((seat) => "answer" in seat ? [seat.answer.receipt] : []);
+      const costs = receipts.flatMap((receipt) => receipt.costSats === undefined ? [] : [receipt.costSats]);
+      const totalCostSats = costs.length ? costs.reduce((sum, cost) => sum + cost, 0) : undefined;
+      const allChargesReported = receipts.length === seats.length && receipts.every((r) => r.overTarget !== undefined);
       const body = seats
         .map((s) =>
           "answer" in s
-            ? `## ${s.model}\n${s.answer.text || "(no text)"}\n\n— ${footer(s.answer)}${s.answer.cut ? `\n${cutNote}` : ""}`
+            ? `## ${s.model}\n${s.answer.text || "(no text)"}\n\n— ${footer(s.answer.receipt)}`
             : `## ${s.model}\nFailed: ${s.error}`
         )
         .join("\n\n");
-      return text(`${body}\n\nTotal: ${sats(total)} sats`, seats.every((s) => "error" in s));
+      const total = totalCostSats === undefined ? "unavailable" : `${sats(totalCostSats)} sats`;
+      return text(`${body}\n\nTotal: ${total}${allChargesReported ? "" : " (partial or estimated)"}`, receipts.length === 0, {
+        seats: seats.map((seat) => "answer" in seat ? { model: seat.model, receipt: seat.answer.receipt } : seat),
+        totalCostSats,
+        allChargesReported,
+      });
     }
   );
 

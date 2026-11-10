@@ -2,16 +2,23 @@
 
 Give your AI agent every model sold on [Routstr](https://routstr.com), paid in sats.
 
-routstr-mcp is an MCP server. Add it to Claude Code, Claude Desktop, Cursor or any other MCP app, and the agent gets four tools:
+routstr-mcp is an MCP server. Add it to Claude Code, Claude Desktop, Cursor or any other MCP app, and the agent gets these tools:
 
 | Tool | What it does |
 | --- | --- |
-| `ask` | Ask one model and get its answer, with what it cost |
-| `council` | Ask 2 to 5 models the same question at once, to compare answers |
+| `quote` | Estimate the cost and output limit for an exact prompt without calling a model |
+| `ask` | Ask one model and get its answer and a structured cost receipt |
+| `council` | Ask 2 to 5 models the same question and get a cost receipt for each answer |
 | `find_models` | Search the models on approved Routstr nodes, cheapest first, with prices in sats |
 | `balance` | Sats left, per node |
 
 Use it for a second opinion from a different model, to compare several models, or to hand a simple job to a cheap one. There is no account and no card: you prepay a few sats over Lightning, and that prepaid balance is the most the agent can ever spend.
+
+Call `quote` with the same `model`, `prompt`, optional `system`, and `max_sats` you plan to pass to `ask`. It returns the selected model and node, advertised rates, and the estimated cost of the initial request. Pass the returned `model` and `node` to `ask` to keep the request on that node. A quote can also help pick a node before funding. The quote uses catalog prices, and the node can select its own upstream route and settle a different amount.
+
+`ask` returns its receipt in `structuredContent.receipt`. It includes the estimate, output limit, and node charge when available. The receipt also records the request ID, upstream provider, token counts (including reasoning and cache counts), and finish reason when reported. `costSource` distinguishes node-reported charges, estimates based on token usage, and unavailable costs. `overTarget` flags a reported charge above the requested target.
+
+For reasoning models, pass `reasoning_effort` (for example `"low"`) to request less thinking. The serving route determines which efforts it supports. The quote and receipt record the requested effort.
 
 ## Set up
 
@@ -55,7 +62,7 @@ routstr-mcp import --node <url>     add a Routstr key you already have (read fro
 ## How your sats stay safe
 
 - **The prepaid balance is a hard cap.** Your sats sit on the node as the balance of a Routstr API key. Nothing can spend more than you paid in.
-- **Each call has its own cap.** The agent can pass `max_sats` (default 100, at most 500). The answer length is set so the call fits under it, counting the prompt on the high side (code and non-Latin text use more tokens), and the cost is shown after every answer.
+- **Each call has a spend target.** The agent can pass `max_sats` (default 100, at most 500). This sizes the output token limit using the catalog estimate. The node settles the charge, which can exceed the target.
 - **The agent never sees a secret.** API keys, invoices and Cashu tokens stay in the wallet file and the terminal, and are removed from anything a node sends back. There is no tool that funds or refunds, so the MCP tools alone cannot move your sats. An agent that also has a shell (Claude Code, Cursor) could still run the CLI or read the wallet file, so keep your app asking before it runs commands.
 - **The wallet is private.** It lives in `~/.routstr-mcp/wallet.json`, readable only by you. A refund token is also saved in `~/.routstr-mcp/refunds/` before the key is dropped, so a crash cannot lose it.
 - **A stopped payment is not lost.** If you pay after closing the `fund` command, the sats are picked up the next time the wallet is used.
@@ -69,8 +76,8 @@ Nodes announce themselves on Nostr. routstr-mcp uses the same rule as the Routst
 | Variable | Default | |
 | --- | --- | --- |
 | `ROUTSTR_NODES` | found on Nostr | Comma separated node URLs to use instead of discovery |
-| `ROUTSTR_SATS_PER_CALL` | `100` | What one call may cost when the agent does not say |
-| `ROUTSTR_MAX_SATS_PER_CALL` | `500` | The most one call may cost, whatever the agent asks |
+| `ROUTSTR_SATS_PER_CALL` | `100` | Default spend target in sats |
+| `ROUTSTR_MAX_SATS_PER_CALL` | `500` | Maximum spend target the agent can request |
 | `ROUTSTR_RELAYS` | damus, nos.lol, relay.routstr.com | Nostr relays for discovery |
 | `ROUTSTR_CURATOR` | the Routstr curator | Pubkey whose reviews approve nodes |
 | `ROUTSTR_MCP_HOME` | `~/.routstr-mcp` | Where the wallet lives |

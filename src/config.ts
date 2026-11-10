@@ -29,8 +29,8 @@ export const config = {
   curator:
     process.env.ROUTSTR_CURATOR ??
     "4ad6fa2d16e2a9b576c863b4cf7404a70d4dc320c0c447d10ad6ff58993eacc8",
-  /** What one call may cost when the agent does not say. */
+  /** Default spend target used to size a call. */
   defaultSatsPerCall: Math.min(number(process.env.ROUTSTR_SATS_PER_CALL, 100), maxSatsPerCall),
-  /** The most one call may ever cost, whatever the agent asks for. */
+  /** Largest spend target the agent may request. */
   maxSatsPerCall,
 };

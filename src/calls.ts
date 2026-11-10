@@ -1,10 +1,11 @@
 import { host, sats } from "./format.js";
 import { NodeError, request } from "./http.js";
-import { offersFor, unitCost, type Market, type Offer } from "./market.js";
+import { normalizeNode, offersFor, unitCost, type Market, type Offer } from "./market.js";
+import { completionCost, type ChatResponse, type CostReceipt, type ReasoningEffort } from "./receipt.js";
 import { balanceOf, readWallet, settleAll, type Key } from "./wallet.js";
 
 /**
- * A token count that errs high, so the per-call cap holds: 2 characters a token for ASCII (code runs
+ * A token count that errs high for budgeting: 2 characters a token for ASCII (code runs
  * near 2.4, prose near 4), and one token per UTF-8 byte for the rest (Chinese, Russian, emoji), since a
  * byte-level tokenizer never needs more.
  */
@@ -17,8 +18,8 @@ const OUTPUT_CEILING = 8192;
 const MIN_OUTPUT = 32;
 
 /**
- * The longest answer that fits in `maxSats`. The node reserves prompt + max_tokens at its
- * own rates before calling upstream, so this is what keeps one call under the cap.
+ * The longest answer estimated to fit in `maxSats` at the advertised rates.
+ * The serving route and final settlement can differ from the estimate.
  */
 export function outputBudget(offer: Offer, promptTokens: number, maxSats: number): number {
   const left = maxSats - promptTokens * offer.promptRate;
@@ -27,12 +28,8 @@ export function outputBudget(offer: Offer, promptTokens: number, maxSats: number
 }
 
 export interface Answer {
-  model: string;
-  node: string;
   text: string;
-  costSats: number;
-  leftSats?: number;
-  cut: boolean;
+  receipt: CostReceipt;
 }
 
 export interface AskInput {
@@ -40,12 +37,12 @@ export interface AskInput {
   prompt: string;
   system?: string;
   maxSats: number;
+  node?: string;
+  reasoningEffort?: ReasoningEffort;
 }
 
-interface ChatResponse {
-  choices?: { message?: { content?: unknown; reasoning_content?: unknown }; finish_reason?: string }[];
-  usage?: { prompt_tokens?: number; completion_tokens?: number };
-}
+const estimateCost = (offer: Offer, promptTokens: number, outputTokens: number) =>
+  promptTokens * offer.promptRate + outputTokens * offer.completionRate;
 
 function answerText(response: ChatResponse): string {
   const content = response.choices?.[0]?.message?.content;
@@ -60,20 +57,61 @@ function answerText(response: ChatResponse): string {
 /** Thrown when no node can answer; the message says what the user can do. */
 export class AskError extends Error {}
 
-export async function ask(market: Market, input: AskInput): Promise<Answer> {
-  await settleAll();
+async function callOffers(market: Market, input: AskInput) {
+  const node = input.node === undefined ? undefined : normalizeNode(input.node.trim());
   const { offers, missed } = await market.load();
-  const all = offersFor(offers, input.model);
+  const all = offersFor(offers, input.model)
+    .filter((offer) => node === undefined || offer.node === node)
+    .sort((a, b) => unitCost(a) - unitCost(b));
   const keys = new Map<string, Key>();
   for (const k of readWallet().keys) if (!keys.has(k.node)) keys.set(k.node, k);
-  const payable = all.filter((o) => keys.has(o.node)).sort((a, b) => unitCost(a) - unitCost(b));
+  const payable = all.filter((o) => keys.has(o.node));
+  return { all, keys, payable, missed: missed.filter((url) => node === undefined || url === node) };
+}
+
+function noOffer(model: string, node?: string): AskError {
+  return new AskError(node === undefined
+    ? `No approved Routstr node sells "${model}". Use find_models to see the exact model ids.`
+    : `No offer for "${model}" on the selected node. Check the model ID and node URL.`);
+}
+
+/** Quote the initial request against the catalog without settling invoices or sending the prompt. */
+export async function quote(market: Market, input: AskInput) {
+  const { all, keys, payable } = await callOffers(market, input);
+  const candidates = payable.length ? payable : all;
+  const promptTokens = estimateTokens((input.system ?? "") + input.prompt);
+  const offer = candidates.find((candidate) => outputBudget(candidate, promptTokens, input.maxSats) >= MIN_OUTPUT)
+    ?? candidates[0];
+  if (!offer) throw noOffer(input.model, input.node);
+  const maxOutputTokens = Math.max(0, outputBudget(offer, promptTokens, input.maxSats));
+  const fitsTarget = maxOutputTokens >= MIN_OUTPUT;
+  const minimumSats = estimateCost(offer, promptTokens, MIN_OUTPUT);
+  if (!Number.isFinite(minimumSats)) throw new AskError("The catalog price is too large to quote.");
+  return {
+    model: offer.id,
+    node: offer.node,
+    targetSats: input.maxSats,
+    estimatedInputTokens: promptTokens,
+    maxOutputTokens,
+    estimatedMaxSats: fitsTarget ? estimateCost(offer, promptTokens, maxOutputTokens) : undefined,
+    requestedReasoningEffort: input.reasoningEffort,
+    minimumSats,
+    inputSatsPerToken: offer.promptRate,
+    outputSatsPerToken: offer.completionRate,
+    hasWalletKey: keys.has(offer.node),
+    fitsTarget,
+  };
+}
+
+export async function ask(market: Market, input: AskInput): Promise<Answer> {
+  await settleAll();
+  const { all, keys, payable, missed } = await callOffers(market, input);
   if (!payable.length) {
     const silent = missed.filter((node) => keys.has(node));
     if (silent.length)
       throw new AskError(`Your sats are on ${silent.map(host).join(", ")}, which did not answer just now. Try again in a minute.`);
-    if (!all.length)
-      throw new AskError(`No approved Routstr node sells "${input.model}". Use find_models to see the exact model ids.`);
-    const cheapest = [...all].sort((a, b) => unitCost(a) - unitCost(b))[0]!;
+    const cheapest = all[0];
+    if (!cheapest) throw noOffer(input.model, input.node);
     throw new AskError(
       keys.size
         ? `"${cheapest.id}" is sold on ${host(cheapest.node)}, where you have no sats yet. ` +
@@ -95,13 +133,13 @@ export async function ask(market: Market, input: AskInput): Promise<Answer> {
     for (let attempt = 0; attempt < 2; attempt++) {
       const maxTokens = outputBudget(offer, promptTokens, budget);
       if (maxTokens < MIN_OUTPUT) {
-        const needed = Math.ceil(promptTokens * offer.promptRate + MIN_OUTPUT * offer.completionRate);
+        const needed = Math.ceil(estimateCost(offer, promptTokens, MIN_OUTPUT));
         const short = budget < input.maxSats ? `only ${sats(budget)} sats are left there` : `${sats(budget)} sats is too little for this prompt on this model`;
         problems.push(`${host(offer.node)}: ${short} (needs at least ${needed})`);
         break;
       }
       try {
-        return await complete(offer, key, messages, maxTokens, promptTokens);
+        return await complete(offer, key, messages, maxTokens, promptTokens, input);
       } catch (e) {
         if (!(e instanceof NodeError)) throw e;
         if (e.status === 402 && attempt === 0) {
@@ -127,28 +165,36 @@ export async function ask(market: Market, input: AskInput): Promise<Answer> {
   throw new AskError(`No node could answer. ${problems.join("; ")}.`);
 }
 
-async function complete(offer: Offer, key: Key, messages: object[], maxTokens: number, promptTokens: number): Promise<Answer> {
-  const { body, headers } = await request<ChatResponse>(offer.node, "/v1/chat/completions", {
+async function complete(
+  offer: Offer, key: Key, messages: object[], maxTokens: number, promptTokens: number, input: AskInput,
+): Promise<Answer> {
+  const { body, headers } = await request<ChatResponse | null>(offer.node, "/v1/chat/completions", {
     method: "POST",
     key: key.key,
     // long enough for a slow reasoning model to write the whole budget (10 tokens a second), since a cut-off call is still billed
     timeoutMs: 60_000 + maxTokens * 100,
-    body: JSON.stringify({ model: offer.id, messages, max_tokens: maxTokens, stream: false }),
+    body: JSON.stringify({
+      model: offer.id, messages, max_tokens: maxTokens, reasoning_effort: input.reasoningEffort, stream: false,
+    }),
   });
-  const charged = headers.get("x-routstr-cost-msats");
-  const usage = body.usage;
-  const costSats =
-    charged !== null && Number(charged) >= 0
-      ? Number(charged) / 1000
-      : (usage?.prompt_tokens ?? promptTokens) * offer.promptRate + (usage?.completion_tokens ?? 0) * offer.completionRate;
+  const response = body ?? {};
+  const cost = completionCost(response, headers, offer);
+  const settled = cost.costSource === "node_header" || cost.costSource === "node_body";
   const left = await balanceOf(key);
   return {
-    model: offer.id,
-    node: offer.node,
-    text: answerText(body),
-    costSats,
-    leftSats: left.sats,
-    cut: body.choices?.[0]?.finish_reason === "length",
+    text: answerText(response),
+    receipt: {
+      ...cost,
+      model: offer.id,
+      node: offer.node,
+      targetSats: input.maxSats,
+      estimatedInputTokens: promptTokens,
+      maxOutputTokens: maxTokens,
+      estimatedMaxSats: estimateCost(offer, promptTokens, maxTokens),
+      requestedReasoningEffort: input.reasoningEffort,
+      overTarget: settled && cost.costSats !== undefined ? cost.costSats > input.maxSats : undefined,
+      balanceSats: Number.isFinite(left.sats) ? left.sats : undefined,
+    },
   };
 }
 

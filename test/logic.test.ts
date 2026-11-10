@@ -103,7 +103,7 @@ test("searchModels needs every word and sorts cheapest first", () => {
   assert.deepEqual(searchModels(offers, "qwen coder").map((m) => m.id), ["qwen3-coder"]);
 });
 
-test("outputBudget fits the answer in the sats cap and the model's limit", () => {
+test("outputBudget sizes the answer using the spend target and the model's limit", () => {
   const smart = offer("smart", 0.01, 0.03, { maxOutput: 2048 });
   assert.equal(outputBudget(smart, 100, 10), Math.floor((10 - 1) / 0.03));
   assert.equal(outputBudget(smart, 100, 1000), 2048);
@@ -111,7 +111,7 @@ test("outputBudget fits the answer in the sats cap and the model's limit", () =>
   assert.ok(outputBudget(smart, 1000, 5) < 0);
 });
 
-test("the token estimate errs high for non-Latin text, so max_sats holds", () => {
+test("the token estimate errs high for non-Latin text", () => {
   // cl100k gives 1,600 tokens for each of these
   assert.ok(estimateTokens("比特币是一种去中心化的数字货币".repeat(100)) >= 1600);
   assert.ok(estimateTokens("🦜🧪🛰️🧬🪐".repeat(100)) >= 1600);
