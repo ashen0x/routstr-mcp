@@ -401,6 +401,7 @@ export function report(result: AgentResult): string {
   const lines = [`## ${run.model} · ${STOPPED[result.stopped]}`];
   if (result.error) lines.push(`Error: ${result.error}`);
   lines.push(result.text.trim() || "(no report)");
+  if (result.text && result.receipts.at(-1)?.finishReason === "length") lines.push("[The report was cut off: the model hit its output limit. A bigger max_sats or a model that reasons less leaves it room.]");
   const changes = run.workspace.changes();
   if (changes.length) {
     const written = run.workspace.writes;
