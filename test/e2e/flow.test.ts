@@ -15,6 +15,7 @@ import { startCore, startMint, startMintProxy, startUpstream, type Service, type
 const coreDir = process.env.KIT_CORE_DIR;
 const skip = coreDir ? false : "set KIT_CORE_DIR to a routstr-core checkout with its .venv";
 const run = fs.mkdtempSync(path.join(os.tmpdir(), "routstr-mcp-e2e-"));
+const project = path.join(run, "project");
 const SECRET = /sk-[A-Za-z0-9]|lnbc|lntb|lnbcrt|cashu[AB]/;
 
 let upstream: Upstream;
@@ -46,6 +47,9 @@ before(async () => {
   ]);
   process.env.ROUTSTR_MCP_HOME = path.join(run, "home");
   process.env.ROUTSTR_NODES = `${nodeA!.url},${nodeB!.url}`;
+  fs.mkdirSync(project);
+  fs.writeFileSync(path.join(project, "notes.txt"), "first line\nhello world\n");
+  process.env.ROUTSTR_WORKSPACE = project;
   wallet = await import("../../src/wallet.js");
   const { createServer } = await import("../../src/server.js");
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
@@ -141,6 +145,40 @@ test("council asks several models at once and totals the cost", { skip }, async 
   assert.match(text, /## e2e-smart\nEcho: pick a number/);
   assert.match(text, /## e2e-cheap\nEcho: pick a number/);
   assert.match(text, /Total: [\d.]+ sats/);
+});
+
+test("delegate runs a subagent with file tools, proposes its edit as a patch and bills every step", { skip }, async () => {
+  const before = await satsOn(nodeA.url);
+  const calls = upstream.seen.length;
+  const { text, isError } = await tool("delegate", { model: "e2e-smart", task: "Read notes.txt and change its greeting.", max_sats: 200 });
+  assert.equal(isError, false, text);
+  const steps = upstream.seen.slice(calls);
+  assert.equal(steps.length, 3, "read, edit, report");
+  assert.deepEqual(steps[0]!.tools, ["ls", "read", "glob", "grep", "git", "edit", "write"], "read access has no shell");
+  assert.match(text, /Report: notes.txt said "hello world"/);
+  assert.match(text, /Proposed changes \(not written/);
+  assert.match(text, /-hello world\n\+hello from the subagent/);
+  assert.equal(fs.readFileSync(path.join(project, "notes.txt"), "utf8"), "first line\nhello world\n", "read access never writes");
+  const after = await satsOn(nodeA.url);
+  const logged = fs.readFileSync(path.join(run, "home", "spend.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((e) => e.purpose === "delegate");
+  assert.equal(logged.length, 3, "every step is in the spend log");
+  const cost = logged.reduce((sum: number, e: { sats: number }) => sum + e.sats, 0);
+  assert.ok(cost > 0 && Math.abs(before - after - cost) < 0.01, `balance fell by ${before - after}, the steps logged ${cost}`);
+  assert.ok(text.includes(`· 3 steps · ${sats(cost)} of 200 sats`), text);
+
+  // a follow-up keeps the conversation, so the scripted model reports at once
+  const session = text.match(/session ([\w-]+) \(pass it/)![1]!;
+  const followUp = await tool("delegate", { session, task: "Anything else?" });
+  assert.equal(followUp.isError, false, followUp.text);
+  assert.match(followUp.text, /· 1 step ·/);
+});
+
+test("delegate with edit access writes the change to disk", { skip }, async () => {
+  const { text, isError } = await tool("delegate", { model: "e2e-cheap", task: "Change the greeting in notes.txt.", access: "edit", max_sats: 200 });
+  assert.equal(isError, false, text);
+  assert.match(text, /Changed files \(written to disk\)/);
+  assert.equal(fs.readFileSync(path.join(project, "notes.txt"), "utf8"), "first line\nhello from the subagent\n");
+  assert.match((await tool("balance")).text, /Spent today: [\d.]+ sats/);
 });
 
 test("when a node is down, ask moves to the next node that has sats", { skip }, async () => {

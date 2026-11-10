@@ -47,6 +47,24 @@ export interface ChatSeen {
   model: string;
   max_tokens?: number;
   prompt: string;
+  tools?: string[];
+}
+
+type Content = string | null | { type: string; text?: string }[];
+const plain = (content: Content) => (Array.isArray(content) ? content.map((p) => p.text ?? `[${p.type}]`).join("\n") : content ?? "");
+
+/** A scripted subagent: reads notes.txt, edits it, then reports what it read; or reports at once when told to stop. */
+function agentStep(messages: { role: string; content: Content }[], toolChoice: unknown) {
+  const results = messages.filter((m) => m.role === "tool").map((m) => plain(m.content));
+  if (toolChoice === "none" || results.length >= 2)
+    return { message: { role: "assistant", content: `Report: notes.txt said ${JSON.stringify(results[0]?.split("\n").find((l) => l.includes("hello"))?.replace(/^\d+\t/, "") ?? "nothing")}` }, finish: "stop" };
+  const call = results.length === 0
+    ? { name: "read", arguments: { path: "notes.txt" } }
+    : { name: "edit", arguments: { path: "notes.txt", old_string: "hello world", new_string: "hello from the subagent" } };
+  return {
+    message: { role: "assistant", content: null, tool_calls: [{ id: `call_${results.length + 1}`, type: "function", function: { name: call.name, arguments: JSON.stringify(call.arguments) } }] },
+    finish: "tool_calls",
+  };
 }
 
 export interface Upstream {
@@ -55,7 +73,7 @@ export interface Upstream {
   close(): Promise<void>;
 }
 
-/** Answers "Echo: <question>", or fails with N when the question holds "[fail=N]". */
+/** Answers "Echo: <question>", or fails with N when the question holds "[fail=N]"; given tools, it acts as a scripted subagent. */
 export async function startUpstream(): Promise<Upstream> {
   const seen: ChatSeen[] = [];
   const json = (res: http.ServerResponse, status: number, body: unknown) =>
@@ -68,18 +86,21 @@ export async function startUpstream(): Promise<Upstream> {
       if (req.method === "POST" && /^(\/v1)?\/chat\/completions$/.test(route!)) {
         if (req.headers.authorization !== `Bearer ${UPSTREAM_KEY}`) return json(res, 401, { error: { message: "bad key" } });
         const body = JSON.parse(raw);
-        const prompt = body.messages.map((m: { content: string }) => m.content).join("\n");
-        seen.push({ model: body.model, max_tokens: body.max_tokens, prompt });
+        const prompt = body.messages.map((m: { content: Content }) => plain(m.content)).join("\n");
+        seen.push({ model: body.model, max_tokens: body.max_tokens, prompt, tools: body.tools?.map((t: { function: { name: string } }) => t.function.name) });
         const fail = prompt.match(/\[fail=(\d+)\]/);
         if (fail) return json(res, Number(fail[1]), { error: { message: "upstream failed on purpose" } });
-        const reply = `Echo: ${body.messages.at(-1).content}`;
+        const { message, finish } = body.tools
+          ? agentStep(body.messages, body.tool_choice)
+          : { message: { role: "assistant", content: `Echo: ${plain(body.messages.at(-1).content)}` }, finish: "stop" };
+        const reply = JSON.stringify(message);
         const usage = { prompt_tokens: Math.ceil(prompt.length / 4), completion_tokens: Math.ceil(reply.length / 4) };
         return json(res, 200, {
           id: `chatcmpl-e2e-${seen.length}`,
           object: "chat.completion",
           created: Math.floor(Date.now() / 1000),
           model: body.model,
-          choices: [{ index: 0, message: { role: "assistant", content: reply }, finish_reason: "stop" }],
+          choices: [{ index: 0, message, finish_reason: finish }],
           usage: { ...usage, total_tokens: usage.prompt_tokens + usage.completion_tokens },
         });
       }
@@ -98,7 +119,7 @@ export async function startUpstream(): Promise<Upstream> {
             pricing: { prompt: String(m.prompt), completion: String(m.completion), request: "0", image: "0", web_search: "0", internal_reasoning: "0" },
             top_provider: { context_length: 8192, max_completion_tokens: 2048, is_moderated: false },
             per_request_limits: null,
-            supported_parameters: ["max_tokens", "temperature", "stream"],
+            supported_parameters: ["max_tokens", "temperature", "stream", "tools", "tool_choice"],
           })),
         });
       if (route === "/api/v1/embeddings/models") return json(res, 200, { data: [] });

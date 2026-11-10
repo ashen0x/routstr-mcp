@@ -15,6 +15,7 @@ const number = (value: string | undefined, fallback: number): number => {
 };
 
 const maxSatsPerCall = number(process.env.ROUTSTR_MAX_SATS_PER_CALL, 500);
+const maxSatsPerTask = number(process.env.ROUTSTR_MAX_SATS_PER_TASK, 2000);
 
 export const config = {
   home: process.env.ROUTSTR_MCP_HOME ?? path.join(os.homedir(), ".routstr-mcp"),
@@ -33,8 +34,12 @@ export const config = {
   defaultSatsPerCall: Math.min(number(process.env.ROUTSTR_SATS_PER_CALL, 100), maxSatsPerCall),
   /** Largest spend target the agent may request. */
   maxSatsPerCall,
+  /** What one subagent run may cost when the agent does not say. */
+  defaultSatsPerTask: Math.min(number(process.env.ROUTSTR_SATS_PER_TASK, 300), maxSatsPerTask),
+  /** The most one subagent run may ever cost. */
+  maxSatsPerTask,
   /** The most all calls together may cost in one day; unset means no daily limit beyond the prepaid balance. */
   dailySats: number(process.env.ROUTSTR_DAILY_SATS, 0) || undefined,
-  /** Folders file attachments may be read from, when the MCP app does not say which folder is open. */
+  /** Folders a subagent and file attachments may read, when the MCP app does not say which folder is open. */
   workspace: list(process.env.ROUTSTR_WORKSPACE),
 };

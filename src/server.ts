@@ -2,14 +2,16 @@ import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { continueAgent, findSession, report, startAgent, type AgentResult } from "./agent.js";
 import { ask, AskError, council, quote, type ContentPart } from "./calls.js";
 import { config } from "./config.js";
 import { host, perMillion, sats, tokens, version } from "./format.js";
 import { Market, searchModels, unitCost } from "./market.js";
 import { reasoningEffortSchema, receiptSchema, type CostReceipt } from "./receipt.js";
+import { closeSandbox, sandboxProblem } from "./sandbox.js";
 import { spentToday } from "./spend.js";
 import { balances, readWallet } from "./wallet.js";
-import { usableRoot, Workspace, WorkspaceError } from "./workspace.js";
+import { usableRoot, Workspace, WorkspaceError, type Access } from "./workspace.js";
 
 /** Where the MCP app started this server: the project folder for most apps. */
 const STARTED_IN = process.cwd();
@@ -19,7 +21,7 @@ const FUND_HINT =
   "`npx routstr-mcp refund` takes unspent sats back.";
 
 const INSTRUCTIONS = `routstr-mcp lets you call AI models sold on Routstr, an open market of nodes paid in bitcoin, as tools.
-Use ask for a second opinion from a different model, and council to compare several models.
+Use ask for a second opinion from a different model, council to compare several models, and delegate to hand a whole task to another model that works in the project on its own (reading, searching, and with the user's say-so editing files or running commands in a sandbox).
 Paid calls draw from the user's prepaid Routstr balance and return cost receipts. Use quote to estimate a specific prompt before spending.
 Use find_models when you are unsure of a model id. Never ask the user for API keys, Cashu tokens or invoices. ${FUND_HINT}`;
 
@@ -281,6 +283,69 @@ export function createServer(market = new Market()): McpServer {
   );
 
   server.registerTool(
+    "delegate",
+    {
+      title: "Hand a task to another model",
+      description:
+        "Give a whole task to a model sold on Routstr (for example Kimi, GLM, DeepSeek or Qwen), which works on its own in the user's project with " +
+        "tools to list, read, glob, grep and git (status, diff, log, show). With access \"edit\" it also edits and writes files; with \"shell\" it also runs " +
+        "commands in a sandbox with no network. With the default \"read\" access its edits come back as a patch you can apply. " +
+        "Good for a code or security review, exploring unfamiliar code, or a self-contained change done by a cheaper or different model. " +
+        "It returns the model's report, changed files, commands run and the cost. max_sats bounds the whole run; each step is paid as it goes. " +
+        "Pass the session id from a report to send a follow-up. Ask the user before using edit or shell access.",
+      inputSchema: {
+        task: z.string().min(1).describe("The whole job, written so it makes sense on its own: the subagent does not see this conversation"),
+        model: z.string().min(1).optional().describe("Model id, e.g. from find_models"),
+        models: z.array(z.string().min(1)).min(1).max(3).optional().describe("1 to 3 model ids that each do the same task at once (read access only), to compare their work"),
+        access: z.enum(["read", "edit", "shell"]).optional().describe("read (default): look only, edits come back as a patch. edit: may change files. shell: may also run commands in a sandbox"),
+        cwd: z.string().optional().describe("Folder inside the project to work in (default: the project root)"),
+        files: filesInput,
+        system: z.string().optional().describe("Extra instructions for the subagent"),
+        max_sats: z.number().positive().max(config.maxSatsPerTask).optional().describe(`Budget for the whole run, per model (default ${config.defaultSatsPerTask}, at most ${config.maxSatsPerTask})`),
+        max_steps: z.number().int().positive().max(100).optional().describe("Most model calls in the run (default 30)"),
+        node: nodePin,
+        reasoning_effort: reasoningEffort,
+        session: z.string().optional().describe("Session id from an earlier report, to continue that run; task is then the follow-up message"),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+    },
+    async ({ task, model, models, access, cwd, files, system, max_sats, max_steps, node, reasoning_effort, session }, extra) => {
+      const note = progress(extra as Extra);
+      const budget = { maxSats: max_sats ?? config.defaultSatsPerTask, maxSteps: max_steps ?? 30, signal: extra.signal, onProgress: note };
+      try {
+        if (session) {
+          const run = findSession(session);
+          if (!run) return text(`There is no session ${session} (sessions last 30 minutes and end when the server restarts). Start a new run.`, true);
+          const result = await continueAgent(market, run, { task, ...budget });
+          return text(report(result), result.stopped === "error");
+        }
+        const chosen = models?.length ? models : model ? [model] : [];
+        if (!chosen.length) return text("Say which model to use: model, or models for up to 3 at once. find_models lists them.", true);
+        const level: Access = access ?? "read";
+        if (chosen.length > 1 && level !== "read") return text("Several models at once only work with read access, so they cannot change the same files. Run one model for edit or shell.", true);
+        if (level === "shell") {
+          const problem = await sandboxProblem();
+          if (problem) return text(`Shell access needs a sandbox, and ${problem}. Use edit access, or install what it names (Linux: bubblewrap, socat and ripgrep).`, true);
+        }
+        let roots = await projectRoots();
+        if (cwd) roots = [new Workspace(roots).resolve(cwd)];
+        const results: AgentResult[] = await Promise.all(
+          chosen.map((m) =>
+            startAgent(market, { ...budget, task, model: m, workspace: new Workspace(roots, level), system, node, reasoningEffort: reasoning_effort, files }).catch(
+              (e: Error) => { throw e instanceof WorkspaceError || e instanceof AskError ? e : new Error(`${m}: ${e.message}`); }
+            )
+          )
+        );
+        const total = results.reduce((sum, r) => sum + r.costSats, 0);
+        const body = results.map(report).join("\n\n");
+        return text(results.length > 1 ? `${body}\n\nTotal: ${sats(total)} sats` : body, results.every((r) => r.stopped === "error"));
+      } catch (e) {
+        return text((e as Error).message, true);
+      }
+    }
+  );
+
+  server.registerTool(
     "find_models",
     {
       title: "Find Routstr models",
@@ -376,4 +441,6 @@ export async function serve(): Promise<void> {
   // stdout carries the MCP messages; anything a library logs there (nostr-tools prints relay notices) could pose as one
   console.log = console.info = console.debug = console.error;
   await createServer().connect(new StdioServerTransport());
+  // the shell sandbox keeps the process alive; when the app goes away, so do we
+  process.stdin.once("end", () => void closeSandbox().finally(() => process.exit(0)));
 }
