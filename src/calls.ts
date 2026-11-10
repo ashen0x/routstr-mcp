@@ -152,12 +152,13 @@ export async function ask(market: Market, input: AskInput): Promise<Answer> {
           }
         }
         // try the next node only when this one never got the request, or refused it without charging
-        if (e.code === "unreachable" || [401, 402, 404, 429].includes(e.status) || e.status >= 500) {
+        if (e.code === "unreachable" || [401, 402, 404, 429].includes(e.status)) {
           problems.push(e.status === 0 ? e.message : `${host(offer.node)}: ${e.status === 402 ? "not enough sats left on this node" : e.message}`);
           break;
         }
         // trying another node now could pay twice
         if (e.status === 0) throw new AskError(`${e.message} while answering; it may still charge for this call.`);
+        if (e.status >= 500) throw new AskError(`${host(offer.node)} failed while answering (${e.message}); it may still charge for this call.`);
         throw new AskError(`${host(offer.node)} refused the request: ${e.message}`);
       }
     }
