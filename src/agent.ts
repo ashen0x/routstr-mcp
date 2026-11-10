@@ -216,7 +216,13 @@ async function runTool(run: AgentRun, call: ToolCall, signal?: AbortSignal): Pro
       const cwd = ws.resolve(str(a.cwd) ?? ".");
       if (!fs.statSync(cwd).isDirectory()) throw new WorkspaceError("cwd must be a folder.");
       const timeout = Math.min(Math.max(int(a.timeout_seconds) ?? 120, 1), 600) * 1000;
-      const r = await runInSandbox(command, ws.roots, cwd, timeout, signal);
+      let r;
+      try {
+        r = await runInSandbox(command, ws.roots, cwd, timeout, signal);
+      } catch (e) {
+        if (signal?.aborted || e instanceof SandboxUnavailable) throw e;
+        throw new WorkspaceError(`bash could not start here: ${(e as Error).message}`);
+      }
       run.commands.push({ command, code: r.code, timedOut: r.timedOut });
       const status = r.timedOut ? `stopped after ${timeout / 1000} s` : `exit ${r.code}`;
       return { result: `${status}\n${scrub(clipOutput(r.output)) || "(no output)"}`, note: `bash ${shown(command)} (${status})` };
