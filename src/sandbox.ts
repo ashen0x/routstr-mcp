@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { config } from "./config.js";
 
 type Manager = typeof import("@anthropic-ai/sandbox-runtime").SandboxManager;
@@ -14,6 +15,17 @@ const PROJECT_SECRETS = ["**/.env", "**/.env.*", "**/*.pem", "**/*.key", "**/*.p
 const PASSED_ENV = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "NVM_DIR", "NVM_BIN", "VOLTA_HOME", "PNPM_HOME", "CARGO_HOME", "RUSTUP_HOME", "GOPATH", "GOROOT", "PYENV_ROOT", "JAVA_HOME"];
 
 const MAX_OUTPUT = 30_000;
+
+/** The library's own folder: its seccomp helper runs inside the sandbox, so it must stay readable even under home or temp. */
+function libraryDir(): string | undefined {
+  try {
+    let dir = path.dirname(fileURLToPath(import.meta.resolve("@anthropic-ai/sandbox-runtime")));
+    while (!fs.existsSync(path.join(dir, "package.json")) && path.dirname(dir) !== dir) dir = path.dirname(dir);
+    return dir;
+  } catch {
+    return undefined;
+  }
+}
 
 let manager: Promise<Manager | string> | undefined;
 let initializedFor = "";
@@ -56,7 +68,7 @@ async function prepare(loaded: Manager, command: string, roots: string[], cwd: s
       filesystem: {
         // home and temp hold other programs' secrets; the project, toolchains and our own scratch are let back in
         denyRead: [home, os.tmpdir(), config.home, ...roots.flatMap((root) => PROJECT_SECRETS.map((p) => path.join(root, p)))],
-        allowRead: [...roots, scratchRoot, ...TOOLCHAINS.map((dir) => path.join(home, dir)).filter((dir) => fs.existsSync(dir))],
+        allowRead: [...roots, scratchRoot, ...[libraryDir()].filter((dir): dir is string => !!dir), ...TOOLCHAINS.map((dir) => path.join(home, dir)).filter((dir) => fs.existsSync(dir))],
         allowWrite: [writeRoot, scratchRoot],
         // git history, the index and stashes stay as the user left them
         denyWrite: [config.home, ...(fs.existsSync(gitDir) && fs.statSync(gitDir).isDirectory() ? [gitDir] : [])],
