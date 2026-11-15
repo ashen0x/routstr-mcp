@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { sats } from "../../src/format.js";
-import { startCore, startMint, startMintProxy, startUpstream, type Service, type Upstream } from "./stack.js";
+import { PAINTER, startCore, startMint, startMintProxy, startUpstream, type Service, type Upstream } from "./stack.js";
 
 const coreDir = process.env.KIT_CORE_DIR;
 const skip = coreDir ? false : "set KIT_CORE_DIR to a routstr-core checkout with its .venv";
@@ -23,6 +23,8 @@ let mint: Service;
 let mintProxy: Awaited<ReturnType<typeof startMintProxy>>;
 let nodeA: Service;
 let nodeB: Service;
+let router: Upstream;
+let nodeC: Service;
 let client: Client;
 let wallet: typeof import("../../src/wallet.js");
 
@@ -38,15 +40,17 @@ const satsOn = async (node: string) => (await wallet.balanceOf(wallet.keyFor(nod
 
 before(async () => {
   if (skip) return;
-  upstream = await startUpstream();
+  [upstream, router] = await Promise.all([startUpstream(), startUpstream(true)]);
   mint = await startMint(path.join(run, "mint"));
   mintProxy = await startMintProxy(mint.url);
-  [nodeA, nodeB] = await Promise.all([
+  [nodeA, nodeB, nodeC] = await Promise.all([
     startCore(coreDir!, path.join(run, "node-a"), mintProxy.url, upstream.url),
     startCore(coreDir!, path.join(run, "node-b"), mint.url, upstream.url),
+    // node C has OpenRouter as its provider, which sells pictures
+    startCore(coreDir!, path.join(run, "node-c"), mint.url, router.url, true),
   ]);
   process.env.ROUTSTR_MCP_HOME = path.join(run, "home");
-  process.env.ROUTSTR_NODES = `${nodeA!.url},${nodeB!.url}`;
+  process.env.ROUTSTR_NODES = `${nodeA!.url},${nodeB!.url},${nodeC!.url}`;
   fs.mkdirSync(project);
   fs.writeFileSync(path.join(project, "notes.txt"), "first line\nhello world\n");
   process.env.ROUTSTR_WORKSPACE = project;
@@ -60,8 +64,9 @@ before(async () => {
 after(async () => {
   if (skip) return;
   await client?.close();
-  await Promise.all([nodeA?.stop(), nodeB?.stop(), mint?.stop()]);
+  await Promise.all([nodeA?.stop(), nodeB?.stop(), nodeC?.stop(), mint?.stop()]);
   await upstream?.close();
+  await router?.close();
   await mintProxy?.close();
 });
 
@@ -104,7 +109,7 @@ test("an invoice paid after core calls it expired still lands in the wallet", { 
 
 test("find_models lists both models with prices and marks the funded ones", { skip }, async () => {
   const { text } = await tool("find_models", { query: "e2e" });
-  assert.match(text, /2 models match "e2e" on 2 nodes/);
+  assert.match(text, /2 models match "e2e" on 3 nodes/);
   assert.match(text, /e2e-cheap · 2 nodes .* funded/);
   assert.ok(text.indexOf("e2e-cheap") < text.indexOf("e2e-smart"), "cheapest first");
 });
@@ -145,6 +150,36 @@ test("council asks several models at once and totals the cost", { skip }, async 
   assert.match(text, /## e2e-smart\nEcho: pick a number/);
   assert.match(text, /## e2e-cheap\nEcho: pick a number/);
   assert.match(text, /Total: [\d.]+ sats/);
+});
+
+test("draw makes a picture from a reference, saves it in the project and bills what the node charged", { skip }, async () => {
+  assert.equal(await wallet.settleInvoice(await wallet.createInvoice(nodeC.url, 200)), "paid");
+  const listed = await tool("find_models", { pictures: true });
+  assert.match(listed.text, new RegExp(`^1 picture model on 3 nodes, for draw\\.[\\s\\S]*\\npainter · 1 node · up to [\\d.]+ sats a picture · takes reference pictures \\([\\d.]+ sats each\\) · funded$`), listed.text);
+  fs.writeFileSync(path.join(project, "sketch.png"), Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64"));
+
+  const before = await satsOn(nodeC.url);
+  const { text, isError } = await tool("draw", { model: PAINTER, prompt: "A red fox, in the style of the sketch", references: ["sketch.png"], path: "art/" });
+  assert.equal(isError, false, text);
+  assert.match(text, /^Saved art\/a-red-fox-in-the-style-of-the-sketch\.png\.\n/);
+  assert.deepEqual(fs.readFileSync(path.join(project, "art", "a-red-fox-in-the-style-of-the-sketch.png")).subarray(1, 4).toString(), "PNG");
+  const sent = router.drawn.at(-1)!;
+  assert.equal(sent.model, PAINTER);
+  assert.match(sent.input_references![0]!.image_url.url, /^data:image\/png;base64,iVBOR/);
+  const cost = Number(text.match(/· ([\d.,]+) sats ·/)![1]!.replace(/,/g, ""));
+  const after = await satsOn(nodeC.url);
+  assert.ok(cost > 0 && Math.abs(before - after - cost) < 0.01, `balance fell by ${before - after}, draw said ${cost}`);
+
+  // the same name again is numbered, never overwritten
+  const again = await tool("draw", { model: PAINTER, prompt: "A red fox, in the style of the sketch", path: "art/" });
+  assert.match(again.text, /^Saved art\/a-red-fox-in-the-style-of-the-sketch-2\.png\./);
+
+  const dear = await tool("draw", { model: PAINTER, prompt: "four foxes", count: 4, max_sats: 50 });
+  assert.equal(dear.isError, true);
+  assert.match(dear.text, /up to [\d.]+ sats, more than max_sats \(50\)/);
+  const outside = await tool("draw", { model: PAINTER, prompt: "a fox", path: "../fox.png" });
+  assert.match(outside.text, /outside the project/);
+  assert.equal(router.drawn.length, 2, "refused draws send nothing");
 });
 
 test("delegate runs a subagent with file tools, proposes its edit as a patch and bills every step", { skip }, async () => {

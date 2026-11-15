@@ -43,9 +43,10 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function pickNode(market: Market, node?: string, model?: string): Promise<string> {
   if (node) return normalizeNode(node);
-  const { offers } = await market.load();
+  const { offers, pictures } = await market.load();
   if (model) {
-    const cheapest = offersFor(offers, model).sort((a, b) => unitCost(a) - unitCost(b))[0];
+    const cheapest = offersFor(offers, model).sort((a, b) => unitCost(a) - unitCost(b))[0]
+      ?? offersFor(pictures, model).sort((a, b) => a.perPicture - b.perPicture)[0];
     if (!cheapest) throw new Error(`No approved node sells "${model}".`);
     console.log(`${host(cheapest.node)} sells ${cheapest.id} cheapest.`);
     return cheapest.node;

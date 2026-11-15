@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { finalizeEvent, generateSecretKey, getPublicKey, type Event } from "nostr-tools/pure";
 import { estimateTokens, outputBudget } from "../src/calls.js";
 import { sats } from "../src/format.js";
-import { approvedNodes, isPublicUrl, offersFor, parseOffers, searchModels, type Offer } from "../src/market.js";
+import { approvedNodes, isPublicUrl, offersFor, parseOffers, parsePictures, searchModels, unitCost, type Offer } from "../src/market.js";
 
 const curatorKey = generateSecretKey();
 const curator = getPublicKey(curatorKey);
@@ -88,6 +88,16 @@ test("parseOffers keeps priced text models only", () => {
   assert.deepEqual(parseOffers("https://a.example", { error: "not a list" }), []);
 });
 
+test("parsePictures keeps models that only make pictures and have a picture price", () => {
+  const pictures = parsePictures("https://a.example", [
+    { id: "painter", architecture: { input_modalities: ["text", "image"], output_modalities: ["image"] }, sats_pricing: { image_output: 40, image: 10 } },
+    { id: "words", architecture: { input_modalities: ["text"], output_modalities: ["image"] }, sats_pricing: { image_output: 5 } },
+    { id: "chat-that-draws", architecture: { output_modalities: ["text", "image"] }, sats_pricing: { prompt: 1, completion: 1, image_output: 5 } },
+    { id: "unpriced", architecture: { output_modalities: ["image"] }, sats_pricing: { image_output: 0 } },
+  ]);
+  assert.deepEqual(pictures.map((p) => [p.id, p.perPicture, p.perReference, p.references]), [["painter", 40, 10, true], ["words", 5, 0, false]]);
+});
+
 test("offersFor matches the exact id or alias first, then the name without its maker", () => {
   const offers = [offer("openai/gpt-5", 1, 1), offer("gpt-5", 1, 1, { node: "https://b.example" }), offer("x", 1, 1, { aliases: ["alias-x"] })];
   assert.deepEqual(offersFor(offers, "gpt-5").map((o) => o.node), ["https://b.example"]);
@@ -99,8 +109,8 @@ test("offersFor matches the exact id or alias first, then the name without its m
 
 test("searchModels needs every word and sorts cheapest first", () => {
   const offers = [offer("qwen3-coder", 0.001, 0.002), offer("qwen3-max", 0.01, 0.03), offer("gpt-5", 0.001, 0.001)];
-  assert.deepEqual(searchModels(offers, "qwen").map((m) => m.id), ["qwen3-coder", "qwen3-max"]);
-  assert.deepEqual(searchModels(offers, "qwen coder").map((m) => m.id), ["qwen3-coder"]);
+  assert.deepEqual(searchModels(offers, "qwen", unitCost).map((m) => m.id), ["qwen3-coder", "qwen3-max"]);
+  assert.deepEqual(searchModels(offers, "qwen coder", unitCost).map((m) => m.id), ["qwen3-coder"]);
 });
 
 test("outputBudget sizes the answer using the spend target and the model's limit", () => {

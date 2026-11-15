@@ -1,10 +1,16 @@
 import { config } from "./config.js";
 import { host, sats } from "./format.js";
 import { NodeError, request } from "./http.js";
-import { normalizeNode, offersFor, unitCost, type Market, type Offer } from "./market.js";
+import { isPublicUrl, normalizeNode, offersFor, unitCost, type Market, type Offer } from "./market.js";
 import { completionCost, type ChatResponse, type CostReceipt, type ReasoningEffort } from "./receipt.js";
 import { allowance, hold, logSpend } from "./spend.js";
 import { balanceOf, readWallet, settleAll, type Key } from "./wallet.js";
+
+const walletKeys = () => {
+  const keys = new Map<string, Key>();
+  for (const k of readWallet().keys) if (!keys.has(k.node)) keys.set(k.node, k);
+  return keys;
+};
 
 /**
  * A token count that errs high for budgeting: 2 characters a token for ASCII (code runs
@@ -162,8 +168,7 @@ async function callOffers(market: Market, model: string, pin?: string, needsVisi
     all = all.filter((o) => o.vision);
     if (!all.length) throw new AskError(`"${model}" does not take images. find_models with vision: true lists the models that do.`);
   }
-  const keys = new Map<string, Key>();
-  for (const k of readWallet().keys) if (!keys.has(k.node)) keys.set(k.node, k);
+  const keys = walletKeys();
   const payable = all.filter((o) => keys.has(o.node));
   return { all, keys, payable, missed: missed.filter((url) => node === undefined || url === node) };
 }
@@ -172,6 +177,45 @@ function noOffer(model: string, node?: string): AskError {
   return new AskError(node === undefined
     ? `No approved Routstr node sells "${model}". Use find_models to see the exact model ids.`
     : `No offer for "${model}" on the selected node. Check the model ID and node URL.`);
+}
+
+/** Why nothing can be paid for: the sats are on a node that did not answer, or not where the model is sold. */
+function unfunded(model: string, all: { id: string; node: string }[], keys: Map<string, Key>, missed: string[], node?: string): AskError {
+  const silent = missed.filter((n) => keys.has(n));
+  if (silent.length) return new AskError(`Your sats are on ${silent.map(host).join(", ")}, which did not answer just now. Try again in a minute.`);
+  const cheapest = all[0];
+  if (!cheapest) return noOffer(model, node);
+  return new AskError(
+    keys.size
+      ? `"${cheapest.id}" is sold on ${host(cheapest.node)}, where you have no sats yet. ` +
+          `Ask the user to run \`npx routstr-mcp fund 1000 --model ${cheapest.id}\` in a terminal.`
+      : `There are no sats in the Routstr wallet yet. Ask the user to run \`npx routstr-mcp fund 1000\` in a terminal.`
+  );
+}
+
+/** What may be spent on one call: its target, or less when little of today's limit is left. */
+function spendCap(maxSats: number): number {
+  const today = allowance();
+  if (today < 1)
+    throw new AskError(`Today's limit of ${sats(config.dailySats!)} sats (ROUTSTR_DAILY_SATS) is used up. It starts again at midnight, or the user can raise it.`);
+  return Math.min(maxSats, today);
+}
+
+/**
+ * After a paid call failed: counts what the node may charge against today's limit, and returns the error when
+ * the node refused without charging, so the next node may be tried. Otherwise trying another node could pay twice.
+ */
+function refusal(e: unknown, offer: { id: string; node: string }, budget: number, purpose: string): NodeError {
+  if (!(e instanceof NodeError)) throw e;
+  // the node got the request and may bill it: count it against today's limit at its most
+  const mayCharge = e.code === "lost" || (e.code === "cancelled" && e.message !== "Cancelled") || (e.status >= 500 && e.status !== 0);
+  if (mayCharge) logSpend({ model: offer.id, node: offer.node, sats: budget, purpose, unsure: true });
+  if (e.code === "cancelled") throw new AskError(e.message === "Cancelled" ? "Cancelled before the node got the request." : `${e.message}.`);
+  // 424: its upstream failed and it gave the hold back
+  if (e.code === "unreachable" || [401, 402, 404, 424, 429].includes(e.status)) return e;
+  if (e.status === 0) throw new AskError(`${e.message} while answering; it may still charge for this call.`);
+  if (e.status >= 500) throw new AskError(`${host(offer.node)} failed while answering (${e.message}); it may still charge for this call.`);
+  throw new AskError(`${host(offer.node)} refused the request: ${e.message}`);
 }
 
 export function askMessages(input: Pick<AskInput, "prompt" | "system" | "attachments">): Message[] {
@@ -214,24 +258,8 @@ export async function chat(market: Market, input: ChatInput): Promise<Reply> {
   await settleAll();
   const { tokens: promptTokens, images } = promptSize(input.messages, input.tools);
   const { all, keys, payable, missed } = await callOffers(market, input.model, input.node, images > 0);
-  if (!payable.length) {
-    const silent = missed.filter((node) => keys.has(node));
-    if (silent.length)
-      throw new AskError(`Your sats are on ${silent.map(host).join(", ")}, which did not answer just now. Try again in a minute.`);
-    const cheapest = all[0];
-    if (!cheapest) throw noOffer(input.model, input.node);
-    throw new AskError(
-      keys.size
-        ? `"${cheapest.id}" is sold on ${host(cheapest.node)}, where you have no sats yet. ` +
-            `Ask the user to run \`npx routstr-mcp fund 1000 --model ${cheapest.id}\` in a terminal.`
-        : `There are no sats in the Routstr wallet yet. Ask the user to run \`npx routstr-mcp fund 1000\` in a terminal.`
-    );
-  }
-
-  const today = allowance();
-  if (today < 1)
-    throw new AskError(`Today's limit of ${sats(config.dailySats!)} sats (ROUTSTR_DAILY_SATS) is used up. It starts again at midnight, or the user can raise it.`);
-  const cap = Math.min(input.maxSats, today);
+  if (!payable.length) throw unfunded(input.model, all, keys, missed, input.node);
+  const cap = spendCap(input.maxSats);
   const problems: string[] = [];
 
   for (const listed of payable) {
@@ -258,12 +286,8 @@ export async function chat(market: Market, input: ChatInput): Promise<Reply> {
           reply.listedSats = estimateCost(listed, r.inputTokens, r.outputTokens);
         logSpend({ model: offer.id, node: offer.node, sats: reply.receipt.costSats ?? estimateCost(offer, promptTokens, maxTokens, images), purpose: input.purpose, unsure: reply.receipt.costSats === undefined || undefined });
         return reply;
-      } catch (e) {
-        if (!(e instanceof NodeError)) throw e;
-        // the node got the request and may bill it: count it against today's limit at its most
-        const mayCharge = e.code === "lost" || (e.code === "cancelled" && e.message !== "Cancelled") || (e.status >= 500 && e.status !== 0);
-        if (mayCharge) logSpend({ model: offer.id, node: offer.node, sats: budget, purpose: input.purpose, unsure: true });
-        if (e.code === "cancelled") throw new AskError(e.message === "Cancelled" ? "Cancelled before the node got the request." : `${e.message}.`);
+      } catch (thrown) {
+        const e = refusal(thrown, offer, budget, input.purpose);
         if (e.status === 402 && attempt === 0) {
           // the key holds less than this call may cost: fit the answer to what is left, with room for the node's own estimate
           const { sats: owned = 0, reservedSats = 0 } = await balanceOf(key);
@@ -273,18 +297,11 @@ export async function chat(market: Market, input: ChatInput): Promise<Reply> {
             continue;
           }
         }
-        // try the next node only when this one never got the request, or refused it without charging (424: its upstream failed and it gave the hold back)
-        if (e.code === "unreachable" || [401, 402, 404, 424, 429].includes(e.status)) {
-          problems.push(
-            e.status === 0 ? e.message
-            : `${host(offer.node)}: ${e.status === 402 ? `not enough sats left on this node${images ? " (a node holds sats for the whole image data while the call runs, so images need a bigger balance)" : ""}` : e.message}`
-          );
-          break;
-        }
-        // trying another node now could pay twice
-        if (e.status === 0) throw new AskError(`${e.message} while answering; it may still charge for this call.`);
-        if (e.status >= 500) throw new AskError(`${host(offer.node)} failed while answering (${e.message}); it may still charge for this call.`);
-        throw new AskError(`${host(offer.node)} refused the request: ${e.message}`);
+        problems.push(
+          e.status === 0 ? e.message
+          : `${host(offer.node)}: ${e.status === 402 ? `not enough sats left on this node${images ? " (a node holds sats for the whole image data while the call runs, so images need a bigger balance)" : ""}` : e.message}`
+        );
+        break;
       } finally {
         release();
       }
@@ -363,4 +380,114 @@ export async function council(
       }
     })
   );
+}
+
+export interface DrawInput {
+  model: string;
+  prompt: string;
+  /** reference pictures as data URLs or https links */
+  references?: string[];
+  count: number;
+  /** "1K", "2K", "1024x1536" and the like */
+  size?: string;
+  maxSats: number;
+  node?: string;
+  signal?: AbortSignal;
+}
+
+export interface Drawing {
+  model: string;
+  node: string;
+  /** the bytes of each picture that came back */
+  pictures: Buffer[];
+  estimatedMaxSats: number;
+  costSats?: number;
+  balanceSats?: number;
+}
+
+const MAX_PICTURE_BYTES = 48 << 20;
+
+/** A picture a node sent as a link, fetched only from a public https address and only up to the size core relays inline. */
+async function fetchPicture(url: string): Promise<Buffer | undefined> {
+  if (!isPublicUrl(url)) return undefined;
+  try {
+    const res = await fetch(url, { redirect: "error", signal: AbortSignal.timeout(60_000) });
+    if (!res.ok || !res.body) return undefined;
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    for await (const chunk of res.body) {
+      if ((size += chunk.byteLength) > MAX_PICTURE_BYTES) return undefined;
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Pictures from the cheapest funded node that sells the model, paid like chat: never two nodes for one request. */
+export async function draw(market: Market, input: DrawInput): Promise<Drawing> {
+  await settleAll();
+  const pin = input.node === undefined ? undefined : normalizeNode(input.node.trim());
+  const { pictures, missed } = await market.load();
+  const refs = input.references ?? [];
+  const sold = offersFor(pictures, input.model).filter((o) => pin === undefined || o.node === pin).sort((a, b) => a.perPicture - b.perPicture);
+  if (!sold.length) throw new AskError(`No approved Routstr node sells a picture model "${input.model}". find_models with pictures: true lists them.`);
+  const all = refs.length ? sold.filter((o) => o.references) : sold;
+  if (!all.length) throw new AskError(`"${input.model}" does not take reference pictures. find_models with pictures: true shows which models do.`);
+  const keys = walletKeys();
+  const payable = all.filter((o) => keys.has(o.node));
+  if (!payable.length) throw unfunded(input.model, all, keys, missed.filter((n) => pin === undefined || n === pin), input.node);
+  const cap = spendCap(input.maxSats);
+  const problems: string[] = [];
+
+  for (const offer of payable) {
+    if (input.signal?.aborted) throw new AskError("Cancelled before anything was sent.");
+    // a node holds the dearest size for each picture, so this is the most it can charge
+    const most = input.count * offer.perPicture + refs.length * offer.perReference;
+    if (most > cap) {
+      problems.push(`${host(offer.node)}: up to ${sats(most)} sats, more than ${cap < input.maxSats ? `the ${sats(cap)} sats left of today's limit` : `max_sats (${sats(cap)})`}`);
+      continue;
+    }
+    const key = keys.get(offer.node)!;
+    const release = hold(most);
+    try {
+      const { body, headers } = await request<{ data?: { b64_json?: unknown; url?: unknown }[] } | null>(offer.node, "/v1/images/generations", {
+        method: "POST",
+        key: key.key,
+        timeoutMs: 300_000,
+        // core relays pictures up to 40 MB
+        maxBytes: MAX_PICTURE_BYTES,
+        signal: input.signal,
+        body: JSON.stringify({
+          model: offer.id,
+          prompt: input.prompt,
+          n: input.count,
+          ...(input.size ? { size: input.size } : {}),
+          ...(refs.length ? { input_references: refs.map((url) => ({ type: "image_url", image_url: { url } })) } : {}),
+        }),
+      });
+      const msats = headers.get("x-routstr-cost-msats");
+      const costSats = msats !== null && /^\d+$/.test(msats) ? Number(msats) / 1000 : undefined;
+      logSpend({ model: offer.id, node: offer.node, sats: costSats ?? most, purpose: "draw", unsure: costSats === undefined || undefined });
+      const made = await Promise.all((Array.isArray(body?.data) ? body.data : []).map((p) =>
+        typeof p?.b64_json === "string" ? Buffer.from(p.b64_json, "base64") : typeof p?.url === "string" ? fetchPicture(p.url) : undefined
+      ));
+      const left = await balanceOf(key);
+      return {
+        model: offer.id,
+        node: offer.node,
+        pictures: made.filter((p): p is Buffer => p !== undefined && p.length > 0),
+        estimatedMaxSats: most,
+        costSats,
+        balanceSats: Number.isFinite(left.sats) ? left.sats : undefined,
+      };
+    } catch (thrown) {
+      const e = refusal(thrown, offer, most, "draw");
+      problems.push(e.status === 0 ? e.message : `${host(offer.node)}: ${e.status === 402 ? "not enough sats left on this node" : e.message}`);
+    } finally {
+      release();
+    }
+  }
+  throw new AskError(`No node could draw it. ${problems.join("; ")}.`);
 }

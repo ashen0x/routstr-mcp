@@ -209,21 +209,38 @@ interface RawModel {
   enabled?: boolean;
   architecture?: { input_modalities?: string[]; output_modalities?: string[] };
   top_provider?: { context_length?: number | null; max_completion_tokens?: number | null } | null;
-  sats_pricing?: { prompt?: number; completion?: number; image?: number; request?: number; web_search?: number; internal_reasoning?: number } | null;
+  sats_pricing?: { prompt?: number; completion?: number; image?: number; image_output?: number; request?: number; web_search?: number; internal_reasoning?: number } | null;
+}
+
+/** One picture model as one node sells it, for draw. */
+export interface PictureOffer {
+  node: string;
+  id: string;
+  name: string;
+  aliases: string[];
+  /** the most one picture costs, in sats */
+  perPicture: number;
+  /** sats per reference picture sent along */
+  perReference: number;
+  /** takes reference pictures */
+  references: boolean;
 }
 
 const count = (value: unknown) => (Number.isSafeInteger(value) && (value as number) > 0 ? (value as number) : undefined);
 const rate = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value > 0;
 
 /**
- * Text models a node prices in sats. Zero-priced models are left out: their real price is unknown.
- * Ids with anything but the characters model ids use are dropped too, so a node cannot write its own lines into what
- * the agent reads, or shell code into the fund line it hands the user.
+ * The enabled models of a node's list. Ids with anything but the characters model ids use are dropped, so a node
+ * cannot write its own lines into what the agent reads, or shell code into the fund line it hands the user.
  */
-export function parseOffers(node: string, models: unknown): Offer[] {
-  return (Array.isArray(models) ? (models as RawModel[]) : [])
+const listed = (models: unknown) =>
+  (Array.isArray(models) ? (models as RawModel[]) : [])
     .filter((m) => m && typeof m === "object" && m.enabled !== false)
-    .filter((m) => typeof m.id === "string" && /^~?[\w./:@+-]{1,200}$/.test(m.id))
+    .filter((m) => typeof m.id === "string" && /^~?[\w./:@+-]{1,200}$/.test(m.id));
+
+/** Text models a node prices in sats. Zero-priced models are left out: their real price is unknown. */
+export function parseOffers(node: string, models: unknown): Offer[] {
+  return listed(models)
     .filter((m) => (m.architecture?.output_modalities ?? ["text"]).includes("text"))
     .filter((m) => rate(m.sats_pricing?.prompt) && rate(m.sats_pricing?.completion))
     .map((m) => ({
@@ -242,12 +259,33 @@ export function parseOffers(node: string, models: unknown): Offer[] {
     }));
 }
 
+/** Models that only make pictures, which nodes sell by the picture; the price is the most one can cost. */
+export function parsePictures(node: string, models: unknown): PictureOffer[] {
+  return listed(models)
+    .filter((m) => m.architecture?.output_modalities?.length === 1 && m.architecture.output_modalities[0] === "image")
+    .filter((m) => rate(m.sats_pricing?.image_output))
+    .map((m) => ({
+      node,
+      id: m.id,
+      name: typeof m.name === "string" ? m.name : m.id,
+      aliases: Array.isArray(m.alias_ids) ? m.alias_ids.filter((a) => typeof a === "string") : [],
+      perPicture: m.sats_pricing!.image_output!,
+      perReference: rate(m.sats_pricing?.image) ? m.sats_pricing!.image! : 0,
+      references: !!m.architecture?.input_modalities?.includes("image"),
+    }));
+}
+
 /** How long a node's last good model list stands in when a refresh of it fails. */
 const LAST_GOOD_MS = 60 * 60_000;
 
+interface Listing {
+  offers: Offer[];
+  pictures: PictureOffer[];
+}
+
 export class Market {
-  private cache?: { at: number; offers: Offer[]; reached: string[]; missed: string[] };
-  private lastGood = new Map<string, { at: number; offers: Offer[] }>();
+  private cache?: Listing & { at: number; reached: string[]; missed: string[] };
+  private lastGood = new Map<string, Listing & { at: number }>();
 
   async load(force = false) {
     if (!force && this.cache && Date.now() - this.cache.at < MODELS_TTL_MS) return this.cache;
@@ -255,24 +293,26 @@ export class Market {
     const results = await Promise.allSettled(
       urls.map(async (node) => {
         const { body } = await request<{ data?: RawModel[] }>(node, "/v1/models", { timeoutMs: 10_000 });
-        return parseOffers(node, body?.data);
+        return { offers: parseOffers(node, body?.data), pictures: parsePictures(node, body?.data) };
       })
     );
     const offers: Offer[] = [];
+    const pictures: PictureOffer[] = [];
     const reached: string[] = [];
     const missed: string[] = [];
     results.forEach((result, i) => {
       const node = urls[i]!;
       // one slow answer must not hide a node (and the sats on it) until the next refresh
       const last = this.lastGood.get(node);
-      if (result.status === "fulfilled") this.lastGood.set(node, { at: Date.now(), offers: result.value });
-      const list = result.status === "fulfilled" ? result.value : last && Date.now() - last.at < LAST_GOOD_MS ? last.offers : undefined;
+      if (result.status === "fulfilled") this.lastGood.set(node, { at: Date.now(), ...result.value });
+      const list = result.status === "fulfilled" ? result.value : last && Date.now() - last.at < LAST_GOOD_MS ? last : undefined;
       if (list) {
-        offers.push(...list);
+        offers.push(...list.offers);
+        pictures.push(...list.pictures);
         reached.push(node);
       } else missed.push(node);
     });
-    this.cache = { at: Date.now(), offers, reached, missed };
+    this.cache = { at: Date.now(), offers, pictures, reached, missed };
     return this.cache;
   }
 }
@@ -280,7 +320,7 @@ export class Market {
 const bare = (id: string) => id.toLowerCase().split("/").pop()!;
 
 /** Offers for a model name: exact id or alias first, else the same name without its maker prefix. */
-export function offersFor(offers: Offer[], model: string): Offer[] {
+export function offersFor<T extends { id: string; aliases: string[] }>(offers: T[], model: string): T[] {
   const wanted = model.trim().toLowerCase();
   // a real id beats an alias, so one node cannot claim a popular name for a different model
   const exact = offers.filter((o) => o.id.toLowerCase() === wanted);
@@ -290,19 +330,20 @@ export function offersFor(offers: Offer[], model: string): Offer[] {
   return offers.filter((o) => bare(o.id) === bare(wanted));
 }
 
-export interface ModelSummary {
+type Sold = { node: string; id: string; name: string; aliases: string[] };
+
+export interface ModelSummary<T extends Sold> {
   id: string;
   name: string;
   nodes: number;
-  context?: number;
-  cheapest: Offer;
-  offers: Offer[];
+  cheapest: T;
+  offers: T[];
 }
 
 /** Models matching every word of the query, one row per model id, cheapest node first. */
-export function searchModels(offers: Offer[], query = ""): ModelSummary[] {
-  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
-  const byId = new Map<string, Offer[]>();
+export function searchModels<T extends Sold>(offers: T[], query: string | undefined, cost: (offer: T) => number): ModelSummary<T>[] {
+  const words = (query ?? "").toLowerCase().split(/\s+/).filter(Boolean);
+  const byId = new Map<string, T[]>();
   for (const offer of offers) {
     const haystack = `${offer.id} ${offer.name} ${offer.aliases.join(" ")}`.toLowerCase();
     if (!words.every((w) => haystack.includes(w))) continue;
@@ -311,17 +352,10 @@ export function searchModels(offers: Offer[], query = ""): ModelSummary[] {
   }
   return [...byId.values()]
     .map((group) => {
-      const cheapest = group.reduce((a, b) => (unitCost(b) < unitCost(a) ? b : a));
-      return {
-        id: cheapest.id,
-        name: cheapest.name,
-        nodes: new Set(group.map((o) => o.node)).size,
-        context: cheapest.context,
-        cheapest,
-        offers: group,
-      };
+      const cheapest = group.reduce((a, b) => (cost(b) < cost(a) ? b : a));
+      return { id: cheapest.id, name: cheapest.name, nodes: new Set(group.map((o) => o.node)).size, cheapest, offers: group };
     })
-    .sort((a, b) => unitCost(a.cheapest) - unitCost(b.cheapest));
+    .sort((a, b) => cost(a.cheapest) - cost(b.cheapest));
 }
 
 /** The cost of a typical tool call (2,000 tokens in, 1,000 out), used to rank nodes and models. */

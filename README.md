@@ -9,8 +9,9 @@ routstr-mcp is an MCP server. Add it to Claude Code, Codex, Cursor, Claude Deskt
 | `ask` | Ask one model and get its answer and a structured cost receipt |
 | `council` | Ask 2 to 5 models the same question and get a cost receipt for each answer |
 | `delegate` | Hand a whole task to another model, which works in your project on its own with file tools |
+| `draw` | Make pictures with a picture model and save them in your project |
 | `quote` | Estimate the cost and output limit for an exact prompt without calling a model |
-| `find_models` | Search the models on approved Routstr nodes, cheapest first, with prices in sats |
+| `find_models` | Search the models on approved Routstr nodes, cheapest first, with prices in sats (`pictures: true` for picture models) |
 | `balance` | Sats left, per node, and what was spent today |
 
 Use it to put the right model on each job: a second opinion from a different model, several models compared side by side, or a review or a self-contained change handed to a cheaper one such as Kimi, GLM, DeepSeek or Qwen. There is no account and no card: you prepay a few sats over Lightning, and that prepaid balance is the most the agent can ever spend.
@@ -36,6 +37,10 @@ For reasoning models, pass `reasoning_effort` (for example `"low"`) to request l
 Use edit or shell on a clean git tree, so you can see and undo every change. The subagent works in the folders your MCP app has open, else `ROUTSTR_WORKSPACE`, else the folder the app started the server in; `cwd` narrows it to a subfolder. It never reads secret files or folders (`.env`, keys, `.git` internals, `~/.ssh`, wallets).
 
 `max_sats` is the budget for the whole run (default 300, at most 2000) and `max_steps` the most model calls (default 30). Each step is paid as it goes, and the model is told to wrap up when the budget runs low. The report ends with a session id: pass it as `session` with a follow-up `task` within 30 minutes to continue the same run. Long runs send progress notes, and cancelling the tool call stops the run.
+
+### draw
+
+`draw` makes pictures with a picture model (`find_models` with `pictures: true` lists them, with the most one picture costs) and saves them in the project, under `pictures/` named from the prompt, or at the `path` you give, such as `assets/hero.png`. A file that is already there is never overwritten: the new one gets a number. Pass `references` (project paths or https URLs) to edit, restyle or match pictures you have, `count` for up to 4 at once and `size` such as `"2K"`. `max_sats` is a hard limit here: a model whose price could pass it is not used.
 
 ### Slash commands
 

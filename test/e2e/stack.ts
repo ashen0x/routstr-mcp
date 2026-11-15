@@ -67,15 +67,26 @@ function agentStep(messages: { role: string; content: Content }[], toolChoice: u
   };
 }
 
+/** A picture model on the fake OpenRouter: $0.04 a picture and $0.01 a reference, at most 2 references. */
+export const PAINTER = "acme/painter";
+// a 1x1 PNG
+const PIXEL = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
 export interface Upstream {
   url: string;
   seen: ChatSeen[];
+  /** picture requests, as OpenRouter got them */
+  drawn: { model: string; prompt: string; n?: number; input_references?: { image_url: { url: string } }[] }[];
   close(): Promise<void>;
 }
 
-/** Answers "Echo: <question>", or fails with N when the question holds "[fail=N]"; given tools, it acts as a scripted subagent. */
-export async function startUpstream(): Promise<Upstream> {
+/**
+ * Answers "Echo: <question>", or fails with N when the question holds "[fail=N]"; given tools, it acts as a scripted subagent.
+ * As `openrouter`, it is OpenRouter for a node that uses it as its provider, and sells the picture model instead.
+ */
+export async function startUpstream(openrouter = false): Promise<Upstream> {
   const seen: ChatSeen[] = [];
+  const drawn: Upstream["drawn"] = [];
   const json = (res: http.ServerResponse, status: number, body: unknown) =>
     res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
   const server = http.createServer((req, res) => {
@@ -83,6 +94,37 @@ export async function startUpstream(): Promise<Upstream> {
     req.on("data", (d) => (raw += d));
     req.on("end", () => {
       const route = (req.url ?? "/").split("?")[0];
+      if (req.method === "POST" && route === "/api/v1/images") {
+        if (req.headers.authorization !== `Bearer ${UPSTREAM_KEY}`) return json(res, 401, { error: { message: "bad key" } });
+        const body = JSON.parse(raw);
+        drawn.push(body);
+        const n = body.n ?? 1;
+        return json(res, 200, { created: 0, data: Array.from({ length: n }, () => ({ b64_json: PIXEL })), usage: { cost: 0.04 * n + 0.01 * (body.input_references?.length ?? 0) } });
+      }
+      if (route === `/api/v1/images/models/${PAINTER}/endpoints`)
+        return json(res, 200, {
+          endpoints: [{
+            provider_tag: "acme",
+            pricing: [{ billable: "output_image", unit: "image", cost_usd: "0.04" }, { billable: "input_reference", unit: "image", cost_usd: "0.01" }],
+            supported_parameters: { n: { type: "range", min: 1, max: 4 }, input_references: { type: "range", min: 0, max: 2 }, resolution: { type: "enum", values: ["1K", "2K"] } },
+          }],
+        });
+      if (openrouter && route === "/api/v1/models")
+        return json(res, 200, {
+          data: [{
+            id: PAINTER,
+            canonical_slug: PAINTER,
+            name: "Acme Painter",
+            created: 0,
+            description: "e2e picture model",
+            context_length: 4096,
+            architecture: { modality: "text+image->image", input_modalities: ["text", "image"], output_modalities: ["image"], tokenizer: "Other", instruct_type: null },
+            pricing: { prompt: "0", completion: "0", request: "0", image: "0", image_output: "0.04", web_search: "0", internal_reasoning: "0" },
+            top_provider: { context_length: 4096, max_completion_tokens: null, is_moderated: false },
+            per_request_limits: null,
+            supported_parameters: [],
+          }],
+        });
       if (req.method === "POST" && /^(\/v1)?\/chat\/completions$/.test(route!)) {
         if (req.headers.authorization !== `Bearer ${UPSTREAM_KEY}`) return json(res, 401, { error: { message: "bad key" } });
         const body = JSON.parse(raw);
@@ -134,6 +176,7 @@ export async function startUpstream(): Promise<Upstream> {
   return {
     url: `http://127.0.0.1:${port}`,
     seen,
+    drawn,
     close: () => new Promise<void>((resolve) => (server.closeAllConnections(), server.close(() => resolve()))),
   };
 }
@@ -233,8 +276,8 @@ export async function startMintProxy(target: string) {
 
 const LAUNCHER = new URL("../../../test/e2e/core_launcher.py", import.meta.url).pathname;
 
-/** Real routstr-core, paid through `mintUrl`, answering from the fake upstream. */
-export async function startCore(coreDir: string, dir: string, mintUrl: string, upstreamUrl: string): Promise<Service> {
+/** Real routstr-core, paid through `mintUrl`, answering from the fake upstream, or with it as OpenRouter. */
+export async function startCore(coreDir: string, dir: string, mintUrl: string, upstreamUrl: string, openrouter = false): Promise<Service> {
   const python = path.join(coreDir, ".venv", "bin", "python");
   if (!fs.existsSync(python)) throw new Error(`No routstr-core venv at ${python}`);
   fs.mkdirSync(dir, { recursive: true });
@@ -251,8 +294,7 @@ export async function startCore(coreDir: string, dir: string, mintUrl: string, u
       KIT_CORE_PORT: String(port),
       KIT_UPSTREAM_URL: upstreamUrl,
       DATABASE_URL: `sqlite+aiosqlite:///${path.join(dir, "core.db")}`,
-      UPSTREAM_BASE_URL: `${upstreamUrl}/v1`,
-      UPSTREAM_API_KEY: UPSTREAM_KEY,
+      ...(openrouter ? { OPENROUTER_API_KEY: UPSTREAM_KEY } : { UPSTREAM_BASE_URL: `${upstreamUrl}/v1`, UPSTREAM_API_KEY: UPSTREAM_KEY }),
       CASHU_MINTS: mintUrl,
       NAME: "E2E Node",
       HTTP_URL: url,
@@ -270,7 +312,7 @@ export async function startCore(coreDir: string, dir: string, mintUrl: string, u
     async () => {
       const res = await fetch(`${url}/v1/models`);
       const body = (await res.json()) as { data?: { sats_pricing?: unknown }[] };
-      return res.ok && (body.data ?? []).some((m) => m.sats_pricing);
+      return res.ok && !!body.data?.length && body.data.every((m) => m.sats_pricing);
     },
     child
   );

@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { continueAgent, findSession, report, startAgent, type AgentResult } from "./agent.js";
-import { ask, AskError, council, quote, type ContentPart } from "./calls.js";
+import { ask, AskError, council, draw, quote, type ContentPart } from "./calls.js";
 import { config } from "./config.js";
 import { host, perMillion, sats, tokens, version } from "./format.js";
 import { Market, searchModels, unitCost } from "./market.js";
@@ -21,7 +21,7 @@ const FUND_HINT =
   "`npx routstr-mcp refund` takes unspent sats back.";
 
 const INSTRUCTIONS = `routstr-mcp lets you call AI models sold on Routstr, an open market of nodes paid in bitcoin, as tools.
-Use ask for a second opinion from a different model, council to compare several models, and delegate to hand a whole task to another model that works in the project on its own (reading, searching, and with the user's say-so editing files or running commands in a sandbox).
+Use ask for a second opinion from a different model, council to compare several models, delegate to hand a whole task to another model that works in the project on its own (reading, searching, and with the user's say-so editing files or running commands in a sandbox), and draw to make pictures saved in the project.
 Paid calls draw from the user's prepaid Routstr balance and return cost receipts. Use quote to estimate a specific prompt before spending.
 Use find_models when you are unsure of a model id. Never ask the user for API keys, Cashu tokens or invoices. ${FUND_HINT}`;
 
@@ -63,6 +63,16 @@ function footer(receipt: CostReceipt): string {
 
 const nodePin = z.string().trim().min(1).optional().describe("Pin a listed Routstr node by its base URL, as returned by quote.");
 const reasoningEffort = reasoningEffortSchema.optional().describe("Request a reasoning effort. The serving route determines support and behavior.");
+
+/** The file type a picture's first bytes show, or undefined for anything else. */
+function pictureType(data: Buffer): string | undefined {
+  if (data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "png";
+  if (data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return "jpg";
+  if (data.toString("latin1", 0, 4) === "RIFF" && data.toString("latin1", 8, 12) === "WEBP") return "webp";
+  if (data.toString("latin1", 0, 4) === "GIF8") return "gif";
+  if (/^\s*(<\?xml[^>]*>\s*)?<svg[\s>]/i.test(data.toString("utf8", 0, 512))) return "svg";
+  return undefined;
+}
 
 const filesInput = z.array(z.string().min(1)).max(20).optional().describe("Project files to send along, relative to the project root. Secret files (.env, keys) are refused.");
 const imagesInput = z.array(z.string().min(1)).max(4).optional().describe("Images for a vision model: project file paths (PNG, JPEG, GIF, WebP up to 1 MB) or https URLs.");
@@ -346,6 +356,59 @@ export function createServer(market = new Market()): McpServer {
   );
 
   server.registerTool(
+    "draw",
+    {
+      title: "Draw pictures with a Routstr model",
+      description:
+        "Make pictures with a picture model sold on Routstr, paid in sats from the user's prepaid balance, and save them in the project. " +
+        "find_models with pictures: true lists the models and what a picture costs. Pass reference pictures to edit, restyle or match them. " +
+        "Returns where each picture was saved and what it cost.",
+      inputSchema: {
+        model: z.string().min(1).describe("Picture model id, from find_models with pictures: true"),
+        prompt: z.string().min(1).describe("What to draw, in detail"),
+        references: z.array(z.string().min(1)).max(4).optional().describe("Pictures to start from or match: project file paths (PNG, JPEG, GIF, WebP up to 1 MB) or https URLs"),
+        count: z.number().int().min(1).max(4).optional().describe("How many pictures (default 1)"),
+        size: z.string().regex(/^(auto|512|768|1K|1\.5K|2K|4K|\d{2,5}x\d{2,5})$/).optional().describe('Size, e.g. "1K", "2K" or "1024x1536" (default: the model\'s own)'),
+        path: z.string().min(1).optional().describe("Where to save it in the project, e.g. assets/hero.png or assets/ (default: pictures/, named from the prompt). The file type follows what the model made; several pictures are numbered"),
+        max_sats: z.number().positive().max(config.maxSatsPerCall).optional().describe(`The most the pictures may cost in sats (default ${config.defaultSatsPerCall}, at most ${config.maxSatsPerCall}). A model whose price could pass it is not used`),
+        node: nodePin,
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ model, prompt, references, count = 1, size, path: save, max_sats, node }, extra) => {
+      const stop = heartbeat(extra as Extra, model);
+      try {
+        const project = new Workspace(await projectRoots(), "edit");
+        const base = save && !save.endsWith("/")
+          ? save.replace(/\.\w{1,5}$/, "")
+          : `${save ?? "pictures/"}${prompt.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+/, "").slice(0, 40).replace(/-+$/, "") || "picture"}`;
+        // a place the pictures cannot be saved is refused before anything is paid
+        project.resolve(`${base}.png`, { mayNotExist: true });
+        const refs = references?.map((r) => (/^https:\/\//i.test(r) ? r : project.image(r)));
+        const drawn = await draw(market, {
+          model, prompt, references: refs, count, size, node, signal: extra.signal, maxSats: max_sats ?? config.defaultSatsPerCall,
+        });
+        const saved = drawn.pictures.flatMap((data, i) => {
+          const type = pictureType(data);
+          return type ? [project.create(`${base}${count > 1 ? `-${i + 1}` : ""}.${type}`, data)] : [];
+        });
+        const cost = drawn.costSats === undefined ? `up to ${sats(drawn.estimatedMaxSats)} sats (the node did not say)` : `${sats(drawn.costSats)} sats`;
+        return text(
+          (saved.length ? `Saved ${saved.join(", ")}.` : "The node sent no picture.") +
+          (saved.length && saved.length < count ? ` It sent ${saved.length} of the ${count} pictures asked for.` : "") +
+          `\n\n— ${drawn.model} on ${host(drawn.node)} · ${cost}` +
+          (drawn.balanceSats !== undefined ? ` · ${sats(drawn.balanceSats)} sats left there` : ""),
+          !saved.length
+        );
+      } catch (e) {
+        return text((e as Error).message, true);
+      } finally {
+        stop();
+      }
+    }
+  );
+
+  server.registerTool(
     "find_models",
     {
       title: "Find Routstr models",
@@ -358,16 +421,31 @@ export function createServer(market = new Market()): McpServer {
         max_typical_sats: z.number().positive().optional().describe("Only models whose typical call (2k tokens in, 1k out) costs at most this"),
         min_context: z.number().int().positive().optional().describe("Only models with at least this many tokens of context"),
         funded: z.boolean().optional().describe("Only models on a node where the user has sats"),
+        pictures: z.boolean().optional().describe("List the picture models for draw instead, with the most one picture costs"),
         limit: z.number().int().positive().max(100).optional().describe("Rows to return (default 20)"),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
-    async ({ query, vision, max_typical_sats, min_context, funded: onlyFunded, limit }) => {
+    async ({ query, vision, max_typical_sats, min_context, funded: onlyFunded, pictures, limit }) => {
       try {
-        const { offers, reached, missed } = await market.load();
+        const { offers, pictures: drawn, reached, missed } = await market.load();
         const funded = new Set(readWallet().keys.map((k) => k.node));
+        const nodes = `on ${reached.length} node${reached.length === 1 ? "" : "s"}${missed.length ? ` (${missed.length} did not answer)` : ""}`;
+        if (pictures) {
+          const found = searchModels(drawn, query, (p) => p.perPicture)
+            .map((m) => ({ m, paid: m.offers.filter((o) => funded.has(o.node)).sort((a, b) => a.perPicture - b.perPicture)[0] }))
+            .filter(({ paid }) => onlyFunded === undefined || !!paid === onlyFunded);
+          const shown = found.slice(0, limit ?? 20).map(({ m, paid }) => {
+            const at = paid ?? m.cheapest;
+            return `${m.id} · ${m.nodes} node${m.nodes > 1 ? "s" : ""} · up to ${sats(at.perPicture)} sats a picture` +
+              `${at.references ? ` · takes reference pictures${at.perReference ? ` (${sats(at.perReference)} sats each)` : ""}` : ""}${paid ? " · funded" : ""}`;
+          });
+          const head = `${found.length} picture model${found.length === 1 ? "" : "s"}${query ? ` match "${query}"` : ""} ${nodes}, for draw. ` +
+            "Prices are where draw would pay: the cheapest node you have sats on, else the cheapest node.";
+          return text([head, ...shown, found.length > shown.length ? `…and ${found.length - shown.length} more.` : ""].filter(Boolean).join("\n"));
+        }
         // the price ask would pay: the cheapest node with sats on it, else the cheapest node
-        const priced = searchModels(offers, query).map((m) => {
+        const priced = searchModels(offers, query, unitCost).map((m) => {
           const paid = m.offers.filter((o) => funded.has(o.node)).sort((a, b) => unitCost(a) - unitCost(b))[0];
           return { m, paid, at: paid ?? m.cheapest };
         });
@@ -375,20 +453,19 @@ export function createServer(market = new Market()): McpServer {
           ({ m, paid, at }) =>
             (vision === undefined || m.offers.some((o) => !!o.vision) === vision) &&
             (max_typical_sats === undefined || unitCost(at) <= max_typical_sats) &&
-            (min_context === undefined || (m.context ?? 0) >= min_context) &&
+            (min_context === undefined || (m.cheapest.context ?? 0) >= min_context) &&
             (onlyFunded === undefined || !!paid === onlyFunded)
         );
         const shown = rows.slice(0, limit ?? 20).map(({ m, paid, at }) => {
           return (
-            `${m.id} · ${m.nodes} node${m.nodes > 1 ? "s" : ""} · ${tokens(m.context)} context · ` +
+            `${m.id} · ${m.nodes} node${m.nodes > 1 ? "s" : ""} · ${tokens(m.cheapest.context)} context · ` +
             `${perMillion(at.promptRate)} / ${perMillion(at.completionRate)} · ` +
             `typical ${sats(unitCost(at))} sats${m.offers.some((o) => o.vision) ? " · vision" : ""}${at.extraFees ? " · plus search or reasoning fees" : ""}` +
             `${paid ? ` · funded${at !== m.cheapest && unitCost(m.cheapest) < unitCost(at) ? ` (cheapest elsewhere: typical ${sats(unitCost(m.cheapest))})` : ""}` : ""}`
           );
         });
         const head =
-          `${rows.length} model${rows.length === 1 ? "" : "s"}${query ? ` match "${query}"` : ""}${rows.length < priced.length ? " and the filters" : ""} on ${reached.length} node${reached.length === 1 ? "" : "s"}` +
-          `${missed.length ? ` (${missed.length} did not answer)` : ""}. ` +
+          `${rows.length} model${rows.length === 1 ? "" : "s"}${query ? ` match "${query}"` : ""}${rows.length < priced.length ? " and the filters" : ""} ${nodes}. ` +
           "Prices are sats per 1M tokens in / out where ask would pay: the cheapest node you have sats on, else the cheapest node. typical = 2k tokens in, 1k out; funded = you have sats where it is sold.";
         return text([head, ...shown, rows.length > shown.length ? `…and ${rows.length - shown.length} more.` : ""].filter(Boolean).join("\n"));
       } catch (e) {

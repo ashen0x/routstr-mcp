@@ -452,6 +452,22 @@ export class Workspace {
     return this.save(abs, current, content);
   }
 
+  /** Saves bytes as a new file, numbered when the name is taken, so nothing is overwritten. */
+  create(input: string, data: Buffer): string {
+    const wanted = this.resolve(input, { mayNotExist: true });
+    const { dir, name, ext } = path.parse(wanted);
+    fs.mkdirSync(dir, { recursive: true });
+    for (let n = 1; ; n++) {
+      const abs = n === 1 ? wanted : path.join(dir, `${name}-${n}${ext}`);
+      try {
+        fs.writeFileSync(abs, data, { flag: "wx" });
+        return this.show(abs);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      }
+    }
+  }
+
   /** What the run changed, file by file. */
   changes(): { file: string; added: number; removed: number; created: boolean }[] {
     return [...this.changed]

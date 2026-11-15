@@ -67,9 +67,9 @@ export interface NodeResponse<T> {
 export async function request<T>(
   node: string,
   path: string,
-  init: { method?: string; body?: string; key?: string; timeoutMs?: number; signal?: AbortSignal } = {}
+  init: { method?: string; body?: string; key?: string; timeoutMs?: number; signal?: AbortSignal; maxBytes?: number } = {}
 ): Promise<NodeResponse<T>> {
-  const { method = "GET", body: payload, key, timeoutMs = 15_000 } = init;
+  const { method = "GET", body: payload, key, timeoutMs = 15_000, maxBytes = MAX_BODY_BYTES } = init;
   const url = new URL(`${node}${path}`);
   const headers: Record<string, string> = { Accept: "application/json" };
   if (key) headers.Authorization = `Bearer ${key}`;
@@ -95,9 +95,9 @@ export async function request<T>(
   try {
     for await (const chunk of res as AsyncIterable<Buffer>) {
       size += chunk.byteLength;
-      if (size > MAX_BODY_BYTES) {
+      if (size > maxBytes) {
         res.destroy();
-        throw new NodeError(node, 0, `${url.host} sent an answer over ${MAX_BODY_BYTES >> 20} MB`, "too_big");
+        throw new NodeError(node, 0, `${url.host} sent an answer over ${maxBytes >> 20} MB`, "too_big");
       }
       chunks.push(chunk);
     }
