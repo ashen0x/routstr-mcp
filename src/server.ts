@@ -199,7 +199,7 @@ export function createServer(market = new Market()): McpServer {
         "Ask any model sold on Routstr and get its answer, paid in sats from the user's prepaid balance. " +
         "Returns a cost receipt with the node's charge when available.",
       inputSchema: askInput,
-      outputSchema: { receipt: receiptSchema },
+      outputSchema: { answer: z.string(), receipt: receiptSchema },
       annotations: { readOnlyHint: false, openWorldHint: true },
     },
     async ({ model, prompt, system, files, images, max_sats, node, reasoning_effort }, extra) => {
@@ -209,7 +209,7 @@ export function createServer(market = new Market()): McpServer {
           model, prompt, system, node, reasoningEffort: reasoning_effort, maxSats: max_sats ?? config.defaultSatsPerCall,
           attachments: await attachments(files, images), signal: extra.signal,
         });
-        return text(`${answer || "(the model returned no text)"}\n\n— ${footer(receipt)}`, false, { receipt });
+        return text(`${answer || "(the model returned no text)"}\n\n— ${footer(receipt)}`, false, { answer, receipt });
       } catch (e) {
         return text((e as Error).message, true);
       } finally {
@@ -237,7 +237,7 @@ export function createServer(market = new Market()): McpServer {
       },
       outputSchema: {
         seats: z.array(z.union([
-          z.object({ model: z.string(), receipt: receiptSchema }),
+          z.object({ model: z.string(), answer: z.string(), receipt: receiptSchema }),
           z.object({ model: z.string(), error: z.string() }),
         ])),
         totalCostSats: z.number().optional(),
@@ -275,7 +275,7 @@ export function createServer(market = new Market()): McpServer {
         .join("\n\n");
       const total = totalCostSats === undefined ? "unavailable" : `${sats(totalCostSats)} sats`;
       return text(`${body}\n\nTotal: ${total}${allChargesReported ? "" : " (partial or estimated)"}`, receipts.length === 0, {
-        seats: seats.map((seat) => "answer" in seat ? { model: seat.model, receipt: seat.answer.receipt } : seat),
+        seats: seats.map((seat) => "answer" in seat ? { model: seat.model, answer: seat.answer.text, receipt: seat.answer.receipt } : seat),
         totalCostSats,
         allChargesReported,
       });

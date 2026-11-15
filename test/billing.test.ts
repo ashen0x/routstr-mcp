@@ -82,7 +82,8 @@ test("quotes and receipts agree on the request and expose a node-reported overru
   assert.deepEqual(submitted, [{ max_tokens: quote.maxOutputTokens, reasoning_effort: "low", authorization: `Bearer ${key}` }]);
   assert.doesNotMatch(JSON.stringify(asked), new RegExp(key));
   assert.match(JSON.stringify(asked.content), /charged more than the 2 sat target/);
-  const receipt = (asked.structuredContent as { receipt: Record<string, unknown> }).receipt;
+  const { answer, receipt } = asked.structuredContent as { answer: string; receipt: Record<string, unknown> };
+  assert.ok(answer && JSON.stringify(asked.content).includes(answer), "the answer is in the structured result, which some apps show alone");
   assert.deepEqual(receipt, {
     model: "test-model", node, targetSats: 2, estimatedInputTokens: quote.estimatedInputTokens,
     maxOutputTokens: quote.maxOutputTokens, estimatedMaxSats: quote.estimatedMaxSats,
@@ -97,7 +98,7 @@ test("quotes and receipts agree on the request and expose a node-reported overru
   const report = council.structuredContent as { allChargesReported: boolean; totalCostSats: number; seats: object[] };
   assert.equal(report.allChargesReported, false);
   assert.equal(report.totalCostSats, 3.2);
-  assert.deepEqual(report.seats.map((seat) => "receipt" in seat), [true, false]);
+  assert.deepEqual(report.seats.map((seat) => "receipt" in seat && "answer" in seat), [true, false]);
 });
 
 test("reported zero stays a settled charge and estimates use reported token counts", () => {
