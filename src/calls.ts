@@ -1,7 +1,7 @@
 import { config } from "./config.js";
 import { host, sats } from "./format.js";
 import { NodeError, request } from "./http.js";
-import { isPublicUrl, normalizeNode, offersFor, unitCost, type Market, type Offer } from "./market.js";
+import { isPublicUrl, normalizeNode, offersFor, parseOffers, unitCost, type Market, type Offer } from "./market.js";
 import { completionCost, type ChatResponse, type CostReceipt, type ReasoningEffort } from "./receipt.js";
 import { allowance, hold, logSpend } from "./spend.js";
 import { balanceOf, readWallet, settleAll, type Key } from "./wallet.js";
@@ -253,6 +253,36 @@ export async function quote(market: Market, input: AskInput) {
   };
 }
 
+/** A way to a model on a node: its default route, or `path`, one seller of it there. */
+interface Route {
+  offer: Offer;
+  path?: string;
+  seller?: string;
+}
+
+/**
+ * A node's other sellers of a model, priced over its listing, cheapest first: its default route already
+ * tried every seller at or under the listed price, so these are what is left when that route is turned away.
+ */
+async function sellers(offer: Offer): Promise<Route[]> {
+  type Row = { path?: unknown; endpoint?: { tag?: unknown } | null; model?: unknown };
+  try {
+    const { body } = await request<{ data?: Row[] } | null>(offer.node, `/v1/models/paths/model?model_id=${encodeURIComponent(offer.id)}`, { timeoutMs: 10_000 });
+    return (Array.isArray(body?.data) ? body.data : [])
+      .flatMap((row) => {
+        const [rates] = parseOffers(offer.node, [row?.model]);
+        const seller = row?.endpoint?.tag;
+        if (typeof row?.path !== "string" || typeof seller !== "string" || !/^[\w./:@+-]{1,80}$/.test(seller) || !rates || unitCost(rates) <= unitCost(offer)) return [];
+        const { promptRate, completionRate, requestRate, imageRate } = rates;
+        return [{ offer: { ...offer, promptRate, completionRate, requestRate, imageRate }, path: row.path, seller }];
+      })
+      .sort((a, b) => unitCost(a.offer) - unitCost(b.offer))
+      .slice(0, 3);
+  } catch {
+    return [];
+  }
+}
+
 /** One paid chat call on the cheapest funded node that takes it, never paying two nodes for it. */
 export async function chat(market: Market, input: ChatInput): Promise<Reply> {
   await settleAll();
@@ -262,9 +292,12 @@ export async function chat(market: Market, input: ChatInput): Promise<Reply> {
   const cap = spendCap(input.maxSats);
   const problems: string[] = [];
 
-  for (const listed of payable) {
+  // the routes grow while they are tried: a node whose sellers are too busy or dear for its listed price adds its others
+  const routes: Route[] = payable.map((offer) => ({ offer }));
+  for (const { offer: listed, path, seller } of routes) {
     const offer = priced(listed, input.priceFactor);
     const key = keys.get(offer.node)!;
+    const where = `${host(offer.node)}${seller ? ` (seller ${seller})` : ""}`;
     let budget = cap;
     for (let attempt = 0; attempt < 2; attempt++) {
       if (input.signal?.aborted) throw new AskError("Cancelled before anything was sent.");
@@ -275,12 +308,12 @@ export async function chat(market: Market, input: ChatInput): Promise<Reply> {
           budget < cap ? `only ${sats(budget)} sats are left there`
           : cap < input.maxSats ? `only ${sats(cap)} sats are left of today's limit`
           : `${sats(budget)} sats is too little for this prompt on this model`;
-        problems.push(`${host(offer.node)}: ${short} (needs at least ${needed})`);
+        problems.push(`${where}: ${short} (needs at least ${needed})`);
         break;
       }
       const release = hold(budget);
       try {
-        const reply = await complete(offer, key, input, maxTokens, promptTokens, images);
+        const reply = await complete(offer, key, input, maxTokens, promptTokens, images, path);
         const r = reply.receipt;
         if ((r.costSource === "node_header" || r.costSource === "node_body") && r.inputTokens !== undefined && r.outputTokens !== undefined)
           reply.listedSats = estimateCost(listed, r.inputTokens, r.outputTokens);
@@ -297,9 +330,11 @@ export async function chat(market: Market, input: ChatInput): Promise<Reply> {
             continue;
           }
         }
+        // a refusal costs nothing, so the node's next seller may be tried
+        if (!path && (e.status === 429 || (e.status === 404 && /max price/i.test(e.message)))) routes.push(...(await sellers(listed)));
         problems.push(
           e.status === 0 ? e.message
-          : `${host(offer.node)}: ${e.status === 402 ? `not enough sats left on this node${images ? " (a node holds sats for the whole image data while the call runs, so images need a bigger balance)" : ""}` : e.message}`
+          : `${where}: ${e.status === 402 ? `not enough sats left on this node${images ? " (a node holds sats for the whole image data while the call runs, so images need a bigger balance)" : ""}` : e.message}`
         );
         break;
       } finally {
@@ -310,7 +345,7 @@ export async function chat(market: Market, input: ChatInput): Promise<Reply> {
   throw new AskError(`No node could answer. ${problems.join("; ")}.`);
 }
 
-async function complete(offer: Offer, key: Key, input: ChatInput, maxTokens: number, promptTokens: number, images: number): Promise<Reply> {
+async function complete(offer: Offer, key: Key, input: ChatInput, maxTokens: number, promptTokens: number, images: number, path?: string): Promise<Reply> {
   const payload: Record<string, unknown> = {
     model: offer.id, messages: input.messages, max_tokens: maxTokens, reasoning_effort: input.reasoningEffort, stream: false,
   };
@@ -321,6 +356,7 @@ async function complete(offer: Offer, key: Key, input: ChatInput, maxTokens: num
   const { body, headers } = await request<ChatResponse | null>(offer.node, "/v1/chat/completions", {
     method: "POST",
     key: key.key,
+    headers: path ? { "x-routstr-model-path": path } : undefined,
     // long enough for a slow reasoning model to write the whole budget (10 tokens a second), since a cut-off call is still billed
     timeoutMs: 60_000 + maxTokens * 100,
     body: JSON.stringify(payload),

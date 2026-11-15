@@ -113,7 +113,7 @@ routstr-mcp import --node <url>     add a Routstr key you already have (read fro
 
 ## Which nodes it uses
 
-Nodes announce themselves on Nostr. routstr-mcp uses the same rule as the Routstr SDK: a node is used only when the Routstr curator's latest review of it is positive (`trusted`, `verified`, `lgtm`) and no review is negative. Only public HTTPS addresses are used, never a local network, localhost or onion address. If a node is down, out of sats for you or cannot serve the model right now, a call moves to the next node where you have sats. It never moves on once a node may have charged for the call.
+Nodes announce themselves on Nostr. routstr-mcp uses the same rule as the Routstr SDK: a node is used only when the Routstr curator's latest review of it is positive (`trusted`, `verified`, `lgtm`) and no review is negative. Only public HTTPS addresses are used, never a local network, localhost or onion address. If a node is down, out of sats for you or cannot serve the model right now, a call moves to the next node where you have sats. When no node can, because the sellers a node routes the model to at its listed price are busy or cost more than it lists, the call tries up to three of that node's dearer sellers, at their own price. It never moves on once a node may have charged for the call.
 
 ## Settings
 

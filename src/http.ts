@@ -67,11 +67,11 @@ export interface NodeResponse<T> {
 export async function request<T>(
   node: string,
   path: string,
-  init: { method?: string; body?: string; key?: string; timeoutMs?: number; signal?: AbortSignal; maxBytes?: number } = {}
+  init: { method?: string; body?: string; key?: string; headers?: Record<string, string>; timeoutMs?: number; signal?: AbortSignal; maxBytes?: number } = {}
 ): Promise<NodeResponse<T>> {
   const { method = "GET", body: payload, key, timeoutMs = 15_000, maxBytes = MAX_BODY_BYTES } = init;
   const url = new URL(`${node}${path}`);
-  const headers: Record<string, string> = { Accept: "application/json" };
+  const headers: Record<string, string> = { ...init.headers, Accept: "application/json" };
   if (key) headers.Authorization = `Bearer ${key}`;
   if (payload) headers["Content-Type"] = "application/json";
   const timeout = AbortSignal.timeout(timeoutMs);

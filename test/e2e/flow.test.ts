@@ -182,6 +182,29 @@ test("draw makes a picture from a reference, saves it in the project and bills w
   assert.equal(router.drawn.length, 2, "refused draws send nothing");
 });
 
+test("when a node's cheapest seller is busy, ask pays its next seller, at that seller's price", { skip }, async () => {
+  type Row = { endpoint: { tag: string } | null; model: { sats_pricing: { prompt: number; completion: number; request: number } } };
+  const rows = ((await (await fetch(`${nodeC.url}/v1/models/paths/model?model_id=glm`)).json()) as { data: Row[] }).data;
+  const dear = rows.find((r) => r.endpoint?.tag === "dear")!.model.sats_pricing;
+  router.busy.add("cheap");
+  const before = await satsOn(nodeC.url);
+  const calls = router.seen.length;
+  const asked = await tool("ask", { model: "glm", prompt: "busy out there?" });
+  assert.equal(asked.isError, false, asked.text);
+  assert.match(asked.text, /^Echo: busy out there\?/);
+  assert.deepEqual(router.seen.slice(calls).map((s) => s.seller), [undefined, "dear"], "the default route is refused, then the dear seller answers");
+  const { receipt } = (await client.callTool({ name: "ask", arguments: { model: "glm", prompt: "and again?" } })).structuredContent as { receipt: { costSats: number; inputTokens: number; outputTokens: number } };
+  assert.ok(Math.abs(receipt.costSats - (dear.request + receipt.inputTokens * dear.prompt + receipt.outputTokens * dear.completion)) < 0.002, JSON.stringify(receipt));
+  const cost = Number(asked.text.match(/· ([\d.,]+) sats ·/)![1]!.replace(/,/g, "")) + receipt.costSats;
+  assert.ok(Math.abs(before - (await satsOn(nodeC.url)) - cost) < 0.01, "the refused tries cost nothing");
+
+  router.busy.add("dear");
+  const none = await tool("ask", { model: "glm", prompt: "anyone?" });
+  router.busy.clear();
+  assert.equal(none.isError, true);
+  assert.match(none.text, /No node could answer/);
+});
+
 test("delegate runs a subagent with file tools, proposes its edit as a patch and bills every step", { skip }, async () => {
   const before = await satsOn(nodeA.url);
   const calls = upstream.seen.length;

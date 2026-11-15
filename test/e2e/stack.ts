@@ -45,6 +45,8 @@ async function waitFor(what: string, ms: number, ready: () => Promise<boolean>, 
 
 export interface ChatSeen {
   model: string;
+  /** the OpenRouter seller that served it */
+  seller?: string;
   max_tokens?: number;
   prompt: string;
   tools?: string[];
@@ -69,6 +71,38 @@ function agentStep(messages: { role: string; content: Content }[], toolChoice: u
 
 /** A picture model on the fake OpenRouter: $0.04 a picture and $0.01 a reference, at most 2 references. */
 export const PAINTER = "acme/painter";
+/** A chat model the fake OpenRouter has two sellers of, listed at the cheap one's price. */
+export const GLM = "acme/glm";
+const SELLERS: Record<string, { prompt: number; completion: number }> = {
+  cheap: { prompt: 0.000001, completion: 0.000002 },
+  dear: { prompt: 0.000002, completion: 0.000004 },
+};
+
+const TEXT = { modality: "text->text", input_modalities: ["text"], output_modalities: ["text"], tokenizer: "Other", instruct_type: null };
+
+const textModel = (m: { id: string; name: string; prompt: number; completion: number }) => ({
+  id: m.id,
+  canonical_slug: m.id,
+  name: m.name,
+  created: 0,
+  description: "e2e model",
+  context_length: 8192,
+  architecture: TEXT,
+  pricing: { prompt: String(m.prompt), completion: String(m.completion), request: "0", image: "0", web_search: "0", internal_reasoning: "0" },
+  top_provider: { context_length: 8192, max_completion_tokens: 2048, is_moderated: false },
+  per_request_limits: null,
+  supported_parameters: ["max_tokens", "temperature", "stream", "tools", "tool_choice"],
+});
+
+/** OpenRouter's pick of seller: one within provider.max_price, in provider.order, that is not busy. */
+function pickSeller(routing: { max_price?: Record<string, number>; order?: string[] } | undefined, busy: Set<string>) {
+  const cap = routing?.max_price ?? {};
+  const fits = (tag: string) => SELLERS[tag]!.prompt * 1e6 <= (cap.prompt ?? Infinity) && SELLERS[tag]!.completion * 1e6 <= (cap.completion ?? Infinity);
+  const allowed = (routing?.order ?? Object.keys(SELLERS)).filter((tag) => tag in SELLERS && fits(tag));
+  if (!allowed.length) return { status: 404, message: "No endpoints found that satisfy the max price for this request" };
+  const free = allowed.find((tag) => !busy.has(tag));
+  return free ? { tag: free } : { status: 429, message: "Provider returned error" };
+}
 // a 1x1 PNG
 const PIXEL = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
@@ -77,6 +111,8 @@ export interface Upstream {
   seen: ChatSeen[];
   /** picture requests, as OpenRouter got them */
   drawn: { model: string; prompt: string; n?: number; input_references?: { image_url: { url: string } }[] }[];
+  /** OpenRouter sellers that answer 429 */
+  busy: Set<string>;
   close(): Promise<void>;
 }
 
@@ -87,6 +123,7 @@ export interface Upstream {
 export async function startUpstream(openrouter = false): Promise<Upstream> {
   const seen: ChatSeen[] = [];
   const drawn: Upstream["drawn"] = [];
+  const busy = new Set<string>();
   const json = (res: http.ServerResponse, status: number, body: unknown) =>
     res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
   const server = http.createServer((req, res) => {
@@ -109,9 +146,27 @@ export async function startUpstream(openrouter = false): Promise<Upstream> {
             supported_parameters: { n: { type: "range", min: 1, max: 4 }, input_references: { type: "range", min: 0, max: 2 }, resolution: { type: "enum", values: ["1K", "2K"] } },
           }],
         });
+      if (route === `/api/v1/models/${GLM}/endpoints`)
+        return json(res, 200, {
+          data: {
+            id: GLM,
+            name: "Acme GLM",
+            architecture: TEXT,
+            endpoints: Object.entries(SELLERS).map(([tag, p]) => ({
+              tag,
+              provider_name: tag,
+              name: `${tag} | ${GLM}`,
+              context_length: 8192,
+              max_completion_tokens: 2048,
+              pricing: { prompt: String(p.prompt), completion: String(p.completion), request: "0", image: "0" },
+              status: 0,
+              supported_parameters: ["max_tokens", "tools", "tool_choice"],
+            })),
+          },
+        });
       if (openrouter && route === "/api/v1/models")
         return json(res, 200, {
-          data: [{
+          data: [textModel({ id: GLM, name: "Acme GLM", ...SELLERS.cheap! }), {
             id: PAINTER,
             canonical_slug: PAINTER,
             name: "Acme Painter",
@@ -125,11 +180,13 @@ export async function startUpstream(openrouter = false): Promise<Upstream> {
             supported_parameters: [],
           }],
         });
-      if (req.method === "POST" && /^(\/v1)?\/chat\/completions$/.test(route!)) {
+      if (req.method === "POST" && /^(\/api)?(\/v1)?\/chat\/completions$/.test(route!)) {
         if (req.headers.authorization !== `Bearer ${UPSTREAM_KEY}`) return json(res, 401, { error: { message: "bad key" } });
         const body = JSON.parse(raw);
         const prompt = body.messages.map((m: { content: Content }) => plain(m.content)).join("\n");
-        seen.push({ model: body.model, max_tokens: body.max_tokens, prompt, tools: body.tools?.map((t: { function: { name: string } }) => t.function.name) });
+        const pick = openrouter ? pickSeller(body.provider, busy) : undefined;
+        seen.push({ model: body.model, seller: pick?.tag, max_tokens: body.max_tokens, prompt, tools: body.tools?.map((t: { function: { name: string } }) => t.function.name) });
+        if (pick && !pick.tag) return json(res, pick.status!, { error: { message: pick.message, code: pick.status } });
         const fail = prompt.match(/\[fail=(\d+)\]/);
         if (fail) return json(res, Number(fail[1]), { error: { message: "upstream failed on purpose" } });
         const { message, finish } = body.tools
@@ -148,22 +205,7 @@ export async function startUpstream(openrouter = false): Promise<Upstream> {
       }
       if (/^(\/v1)?\/models$/.test(route!))
         return json(res, 200, { object: "list", data: MODELS.map((m) => ({ id: m.id, object: "model", created: 0, owned_by: "e2e" })) });
-      if (route === "/api/v1/models")
-        return json(res, 200, {
-          data: MODELS.map((m) => ({
-            id: m.id,
-            canonical_slug: m.id,
-            name: m.name,
-            created: 0,
-            description: "e2e model",
-            context_length: 8192,
-            architecture: { modality: "text->text", input_modalities: ["text"], output_modalities: ["text"], tokenizer: "Other", instruct_type: null },
-            pricing: { prompt: String(m.prompt), completion: String(m.completion), request: "0", image: "0", web_search: "0", internal_reasoning: "0" },
-            top_provider: { context_length: 8192, max_completion_tokens: 2048, is_moderated: false },
-            per_request_limits: null,
-            supported_parameters: ["max_tokens", "temperature", "stream", "tools", "tool_choice"],
-          })),
-        });
+      if (route === "/api/v1/models") return json(res, 200, { data: MODELS.map(textModel) });
       if (route === "/api/v1/embeddings/models") return json(res, 200, { data: [] });
       if (route === "/0/public/Ticker") return json(res, 200, { error: [], result: { XXBTZUSD: { c: [String(BTC_USD), "1"] } } });
       if (route === "/v2/prices/BTC-USD/spot") return json(res, 200, { data: { amount: String(BTC_USD), base: "BTC", currency: "USD" } });
@@ -177,6 +219,7 @@ export async function startUpstream(openrouter = false): Promise<Upstream> {
     url: `http://127.0.0.1:${port}`,
     seen,
     drawn,
+    busy,
     close: () => new Promise<void>((resolve) => (server.closeAllConnections(), server.close(() => resolve()))),
   };
 }
