@@ -52,6 +52,7 @@ before(async () => {
   ]);
   process.env.ROUTSTR_MCP_HOME = path.join(run, "home");
   process.env.ROUTSTR_NODES = `${nodeA!.url},${nodeB!.url},${nodeC!.url}`;
+  process.env.ROUTSTRD_URL = "off";
   fs.mkdirSync(project);
   fs.writeFileSync(path.join(project, "notes.txt"), "first line\nhello world\n");
   process.env.ROUTSTR_WORKSPACE = project;

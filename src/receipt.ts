@@ -55,6 +55,8 @@ export const receiptSchema = z.object({
   outputCostSats: optionalNumber,
   overTarget: z.boolean().optional(),
   balanceSats: z.number().optional(),
+  /** routstrd paid the node from its own wallet, and balanceSats is what routstrd has left */
+  via: z.literal("routstrd").optional(),
   /** the model also bills searches or reasoning by use, beyond what max_sats can size */
   extraFees: z.boolean().optional(),
 });

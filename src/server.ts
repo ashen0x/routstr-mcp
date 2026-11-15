@@ -4,16 +4,17 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { continueAgent, findSession, report, startAgent, type AgentResult } from "./agent.js";
-import { ask, AskError, council, draw, quote, type ContentPart } from "./calls.js";
+import { ask, AskError, council, draw, payers, quote, type ContentPart } from "./calls.js";
 import { config } from "./config.js";
-import { host, perMillion, sats, tokens, version } from "./format.js";
+import { host, perMillion, sats, satsLeft, tokens, version } from "./format.js";
 import { fundInBrowser, fundingNode } from "./fund.js";
 import { Market, searchModels, unitCost } from "./market.js";
 import { reasoningEffortSchema, receiptSchema, type CostReceipt } from "./receipt.js";
+import { routstrd } from "./routstrd.js";
 import { closeSandbox, sandboxProblem } from "./sandbox.js";
 import { spentToday } from "./spend.js";
 import { balanceOf, balances, keyFor, readWallet } from "./wallet.js";
-import { usableRoot, Workspace, WorkspaceError, type Access } from "./workspace.js";
+import { scrub, usableRoot, Workspace, WorkspaceError, type Access } from "./workspace.js";
 
 /** Where the MCP app started this server: the project folder for most apps. */
 const STARTED_IN = process.cwd();
@@ -28,20 +29,20 @@ Paid calls draw from the user's prepaid Routstr balance and return cost receipts
 Use find_models when you are unsure of a model id. Never ask the user for API keys, Cashu tokens or invoices.
 When a call needs more sats and the user wants to add some, fund asks them to pay in their browser. ${FUND_HINT}`;
 
-/** The agent never sees a wallet secret, even when a node echoes one back in an answer or an error. */
+/** The agent never sees a wallet secret, or a key-shaped one such as routstrd's, even when a node echoes one back in an answer or an error. */
 function redactor(): (value: string) => string {
   let secrets: string[];
   try {
     const wallet = readWallet();
     secrets = [...wallet.keys.map((k) => k.key), ...wallet.pending.flatMap((p) => [p.bolt11, p.key ?? ""])];
   } catch {
-    return (value) => value;
+    return scrub;
   }
   const needles = secrets
     .filter((secret): secret is string => typeof secret === "string")
     .flatMap((secret) => [secret, secret.replace(/^sk-/, "")])
     .filter((secret) => secret.length >= 16);
-  return (value) => needles.reduce((out, secret) => out.split(secret).join("[secret removed]"), value);
+  return (value) => needles.reduce((out, secret) => out.split(secret).join("[secret removed]"), scrub(value));
 }
 
 function text(value: string, isError = false, data?: Record<string, unknown>) {
@@ -59,7 +60,7 @@ function footer(receipt: CostReceipt): string {
   const cost = receipt.costSats === undefined ? "cost unavailable"
     : `${sats(receipt.costSats)} sats${receipt.costSource === "estimate" ? " (estimated)" : ""}`;
   return `${receipt.model} on ${host(receipt.node)} · ${cost}` +
-    (receipt.balanceSats !== undefined ? ` · ${sats(receipt.balanceSats)} sats left there` : "") +
+    satsLeft(receipt.balanceSats, receipt.via) +
     (receipt.overTarget ? `\nThe node charged more than the ${sats(receipt.targetSats)} sat target.` : "") +
     (receipt.finishReason === "length" ? "\nThe model hit its output token limit." : "");
 }
@@ -416,8 +417,7 @@ export function createServer(market = new Market()): McpServer {
         return text(
           (saved.length ? `Saved ${saved.join(", ")}.` : "The node sent no picture.") +
           (saved.length && saved.length < count ? ` It sent ${saved.length} of the ${count} pictures asked for.` : "") +
-          `\n\n— ${drawn.model} on ${host(drawn.node)} · ${cost}` +
-          (drawn.balanceSats !== undefined ? ` · ${sats(drawn.balanceSats)} sats left there` : ""),
+          `\n\n— ${drawn.model} on ${host(drawn.node)} · ${cost}${satsLeft(drawn.balanceSats, drawn.via)}`,
           !saved.length
         );
       } catch (e) {
@@ -449,7 +449,7 @@ export function createServer(market = new Market()): McpServer {
     async ({ query, vision, max_typical_sats, min_context, funded: onlyFunded, pictures, limit }) => {
       try {
         const { offers, pictures: drawn, reached, missed } = await market.load();
-        const funded = new Set(readWallet().keys.map((k) => k.node));
+        const funded = await payers();
         const nodes = `on ${reached.length} node${reached.length === 1 ? "" : "s"}${missed.length ? ` (${missed.length} did not answer)` : ""}`;
         if (pictures) {
           const found = searchModels(drawn, query, (p) => p.perPicture)
@@ -576,9 +576,9 @@ export function createServer(market = new Market()): McpServer {
 }
 
 export async function balanceReport(): Promise<string> {
-  const list = await balances();
+  const [list, daemon] = await Promise.all([balances(), routstrd()]);
   const pending = readWallet().pending;
-  if (!list.length && !pending.length) return `The Routstr wallet is empty. ${FUND_HINT}`;
+  if (!list.length && !pending.length && !daemon?.sats) return `The Routstr wallet is empty. ${FUND_HINT}`;
   const total = list.reduce((sum, b) => sum + (b.sats ?? 0), 0);
   const lines = [`Routstr wallet: ${sats(total)} sats on ${list.length} node${list.length === 1 ? "" : "s"}`];
   for (const b of list)
@@ -589,6 +589,7 @@ export async function balanceReport(): Promise<string> {
     );
   for (const p of pending)
     lines.push(`- ${Date.now() / 1000 > p.expiresAt ? "expired invoice, still counted if paid late" : "waiting for payment"}: ${sats(p.sats)} sats on ${host(p.node)}`);
+  if (daemon) lines.push(`routstrd: ${sats(daemon.sats)} sats, used where this wallet has none or too few`);
   const today = spentToday();
   if (today || config.dailySats) lines.push(`Spent today: ${sats(today)} sats${config.dailySats ? ` of a ${sats(config.dailySats)} sat daily limit` : ""}.`);
   lines.push(FUND_HINT);

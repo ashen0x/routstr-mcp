@@ -148,6 +148,7 @@ before(async () => {
   const node = `http://127.0.0.1:${(mock.address() as AddressInfo).port}`;
   process.env.ROUTSTR_MCP_HOME = home;
   process.env.ROUTSTR_NODES = node;
+  process.env.ROUTSTRD_URL = "off";
   process.env.ROUTSTR_WORKSPACE = project;
   fs.writeFileSync(path.join(home, "wallet.json"), JSON.stringify({ version: 1, keys: [{ node, key: KEY, addedAt: 0 }], pending: [] }), { mode: 0o600 });
   const { createServer } = await import("../src/server.js");

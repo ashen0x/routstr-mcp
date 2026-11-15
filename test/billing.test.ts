@@ -16,12 +16,24 @@ test("quotes and receipts agree on the request and expose a node-reported overru
   const key = "sk-test-credential-123456789";
   const requests: { method: string | undefined; url: string | undefined }[] = [];
   const submitted: { max_tokens: number; reasoning_effort?: string; authorization?: string }[] = [];
+  const routed: { provider?: string | string[]; authorization?: string }[] = [];
   const mock = createHttpServer(async (req, res) => {
     requests.push({ method: req.method, url: req.url });
     res.setHeader("content-type", "application/json");
     if (req.url?.endsWith("/v1/models")) {
-      const rate = req.url.startsWith("/alt/") ? 0.001 : 0.01;
+      const rate = req.url.startsWith("/alt/") ? 0.001 : req.url.startsWith("/via/") ? 0.02 : 0.01;
       res.end(JSON.stringify({ data: [{ id: "test-model", sats_pricing: { prompt: rate, completion: rate } }] }));
+    } else if (req.url === "/routstrd/providers") {
+      res.end(JSON.stringify({ output: { providers: [{ baseUrl: `${node}/via/` }] } }));
+    } else if (req.url === "/routstrd/keys/balance") {
+      res.end(JSON.stringify({ output: { total: 900 } }));
+    } else if (req.url === "/routstrd/v1/chat/completions") {
+      routed.push({ provider: req.headers["x-routstr-provider"], authorization: req.headers.authorization });
+      res.setHeader("x-routstr-cost-msats", "1500");
+      res.end(JSON.stringify({ choices: [{ message: { content: "answer" } }] }));
+    } else if (req.url === "/via/v1/chat/completions") {
+      res.statusCode = 402;
+      res.end(JSON.stringify({ detail: "Insufficient balance" }));
     } else if (req.url === "/v1/balance/info") {
       res.end(JSON.stringify({ balance: 1234, reserved: 0 }));
     } else if (req.url === "/v1/chat/completions") {
@@ -48,9 +60,10 @@ test("quotes and receipts agree on the request and expose a node-reported overru
   await once(mock, "listening");
   const node = `http://127.0.0.1:${(mock.address() as AddressInfo).port}`;
   process.env.ROUTSTR_MCP_HOME = home;
-  process.env.ROUTSTR_NODES = `${node},${node}/alt`;
+  process.env.ROUTSTR_NODES = `${node},${node}/alt,${node}/via`;
+  process.env.ROUTSTRD_URL = `${node}/routstrd`;
   writeFileSync(join(home, "wallet.json"), JSON.stringify({
-    version: 1, keys: [{ node, key, addedAt: 0 }], pending: [],
+    version: 1, keys: [{ node, key, addedAt: 0 }, { node: `${node}/via`, key: `${key}-empty`, addedAt: 0 }], pending: [],
   }), { mode: 0o600 });
 
   const { createServer } = await import("../src/server.js");
@@ -68,7 +81,7 @@ test("quotes and receipts agree on the request and expose a node-reported overru
   assert.equal(quote.hasWalletKey, true);
   assert.equal(quote.fitsTarget, true);
   assert.equal(quote.requestedReasoningEffort, "low");
-  assert.deepEqual(requests.map((request) => request.method), ["GET", "GET"], "quote only fetches the catalog");
+  assert.ok(requests.every((request) => request.method === "GET" && request.url !== "/v1/balance/info"), "quote only reads the catalog and what pays where");
   const unfunded = await tool("quote", { ...args, node: `${node}/alt` });
   assert.equal((unfunded.structuredContent as { quote: { hasWalletKey: boolean } }).quote.hasWalletKey, false);
   const low = await tool("quote", { ...args, max_sats: 0.01 });
@@ -99,6 +112,12 @@ test("quotes and receipts agree on the request and expose a node-reported overru
   assert.equal(report.allChargesReported, false);
   assert.equal(report.totalCostSats, 3.2);
   assert.deepEqual(report.seats.map((seat) => "receipt" in seat && "answer" in seat), [true, false]);
+
+  const viaRoutstrd = await tool("ask", { ...args, node: `${node}/via` });
+  assert.equal(viaRoutstrd.isError, false);
+  assert.deepEqual(routed, [{ provider: `${node}/via`, authorization: undefined }], "routstrd pays what the wallet's key there cannot, and never gets a key");
+  assert.equal((viaRoutstrd.structuredContent as { receipt: { via?: string } }).receipt.via, "routstrd");
+  assert.match(JSON.stringify(viaRoutstrd.content), /1\.5 sats · 900 sats left in routstrd/);
 });
 
 test("reported zero stays a settled charge and estimates use reported token counts", () => {

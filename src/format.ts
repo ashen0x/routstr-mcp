@@ -18,6 +18,9 @@ export const perMillion = (rate: number) => Math.round(rate * 1_000_000).toLocal
 
 export const host = (node: string) => new URL(node).host;
 
+/** " · 120 sats left there", on the node, or in routstrd when it paid the node */
+export const satsLeft = (balance?: number, via?: string) => (balance === undefined ? "" : ` · ${sats(balance)} sats left ${via ? `in ${via}` : "there"}`);
+
 export function tokens(count: number | undefined): string {
   if (!count) return "?";
   return count >= 1_000_000 ? `${trim((count / 1_000_000).toFixed(1))}M` : `${Math.round(count / 1000)}k`;

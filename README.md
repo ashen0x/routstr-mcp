@@ -86,6 +86,8 @@ Apps that show MCP prompts (Claude Code lists them as `/mcp__routstr__…`) get 
 
    In apps that can open a link for you (MCP URL elicitation, as in Claude Code), you can also just ask the agent to add sats: its `fund` tool offers you a page on your own machine with the invoice and waits until it is paid. The agent never sees the invoice.
 
+   If you already run [routstrd](https://github.com/Routstr/routstrd), you can skip this step: a call to a node where routstr-mcp has no sats is paid from routstrd's wallet.
+
 3. Ask your agent something like "ask gpt-5 for a second opinion on this function", "run a council of three models on this question" or "delegate a security review of src/ to kimi".
 
 ## Commands
@@ -107,11 +109,11 @@ routstr-mcp import --node <url>     add a Routstr key you already have (read fro
 
 ## How your sats stay safe
 
-- **The prepaid balance is a hard cap.** Your sats sit on the node as the balance of a Routstr API key. Nothing can spend more than you paid in.
+- **The prepaid balance is a hard cap.** Your sats sit on the node as the balance of a Routstr API key. Nothing can spend more than you paid in. When routstrd pays, its wallet is the cap instead, and it can refill itself if you set that up in routstrd.
 - **Each call has a spend target.** The agent can pass `max_sats` (default 100, at most 500). This sizes the output token limit using the catalog estimate. The node settles the charge, which can exceed the target. A `delegate` run has a budget for all its steps.
 - **A big spend asks you first.** When one tool call may spend more than `ROUTSTR_CONFIRM_SATS` (500 sats), such as a council of five or a large `delegate` budget, apps that can ask (MCP elicitation, as in Claude Code) show you the amount and wait for your yes. If you say no, or the app cannot show the question right now (as when Claude Code runs with `-p`), nothing is sent. Apps without elicitation are not asked, and the call goes ahead.
 - **You can set a daily limit.** With `ROUTSTR_DAILY_SATS`, calls stop for the day once that much is spent. Every paid call is logged to `~/.routstr-mcp/spend.jsonl`; `routstr-mcp spend` sums it up.
-- **The agent never sees a secret.** API keys, invoices and Cashu tokens stay in the wallet file and the terminal, and are removed from anything a node sends back. `fund` only offers you a page to pay from, and there is no tool that refunds, so the MCP tools alone cannot move your sats. An agent that also has a shell (Claude Code, Cursor) could still run the CLI or read the wallet file, so keep your app asking before it runs commands. A `delegate` subagent cannot reach the wallet: it is outside the project, and the shell sandbox blocks the home folder.
+- **The agent never sees a secret.** API keys, invoices and Cashu tokens stay in the wallet file and the terminal, and they and anything shaped like a key are removed from what a node sends back. `fund` only offers you a page to pay from, and there is no tool that refunds, so the MCP tools alone cannot move your sats. An agent that also has a shell (Claude Code, Cursor) could still run the CLI or read the wallet file, so keep your app asking before it runs commands. A `delegate` subagent cannot reach the wallet: it is outside the project, and the shell sandbox blocks the home folder.
 - **The wallet is private.** It lives in `~/.routstr-mcp/wallet.json`, readable only by you. A refund token is also saved in `~/.routstr-mcp/refunds/` before the key is dropped, so a crash cannot lose it.
 - **A stopped payment is not lost.** If you pay after closing the `fund` command, the sats are picked up the next time the wallet is used.
 
@@ -130,6 +132,7 @@ Nodes announce themselves on Nostr. routstr-mcp uses the same rule as the Routst
 | `ROUTSTR_MAX_SATS_PER_TASK` | `2000` | Maximum budget the agent can give one `delegate` run |
 | `ROUTSTR_DAILY_SATS` | none | Most that all calls together may spend in a day |
 | `ROUTSTR_CONFIRM_SATS` | `500` | A tool call that may spend more than this asks you first, in apps that can ask |
+| `ROUTSTRD_URL` | `http://127.0.0.1:8008` | Where routstrd runs, when it pays; `off` never uses it |
 | `ROUTSTR_WORKSPACE` | the open folder | Comma separated project folders for `files` and `delegate`, when the app does not say which folder is open |
 | `ROUTSTR_RELAYS` | damus, nos.lol, relay.routstr.com | Nostr relays for discovery |
 | `ROUTSTR_CURATOR` | the Routstr curator | Pubkey whose reviews approve nodes |

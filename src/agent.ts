@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import { AskError, chat, promptSize, type Message, type ToolCall, type ToolSpec } from "./calls.js";
 import { config } from "./config.js";
-import { host, sats } from "./format.js";
+import { host, sats, satsLeft } from "./format.js";
 import type { Market } from "./market.js";
 import type { CostReceipt, ReasoningEffort } from "./receipt.js";
 import { clipOutput, runInSandbox, SandboxUnavailable } from "./sandbox.js";
@@ -44,7 +44,6 @@ export interface AgentResult {
   costSats: number;
   budgetSats: number;
   steps: number;
-  leftSats?: number;
   /** how many times its listed price the node billed */
   priceFactor: number;
 }
@@ -243,7 +242,6 @@ async function loop(market: Market, run: AgentRun, input: AgentInput): Promise<A
   let text = "";
   let stopped: StopReason = "done";
   let error: string | undefined;
-  let leftSats: number | undefined;
   let wrapUp: "steps" | "budget" | undefined;
 
   run.busy = true;
@@ -306,7 +304,6 @@ async function loop(market: Market, run: AgentRun, input: AgentInput): Promise<A
       const spent = reply.receipt.costSats ?? reply.receipt.estimatedMaxSats;
       cost += spent;
       run.spentSats += spent;
-      leftSats = reply.receipt.balanceSats;
       if (reply.listedSats && reply.receipt.costSats !== undefined) {
         run.billed.paid += reply.receipt.costSats;
         run.billed.listed += reply.listedSats;
@@ -340,7 +337,7 @@ async function loop(market: Market, run: AgentRun, input: AgentInput): Promise<A
     run.busy = false;
     run.lastUsed = Date.now();
   }
-  return { run, text, stopped, error, receipts, costSats: cost, budgetSats: input.maxSats, steps, leftSats, priceFactor: factor(run) };
+  return { run, text, stopped, error, receipts, costSats: cost, budgetSats: input.maxSats, steps, priceFactor: factor(run) };
 }
 
 /** How many times its listed price the node has billed this run, from 1 up to 50. */
@@ -417,7 +414,8 @@ export function report(result: AgentResult): string {
   if (run.commands.length)
     lines.push("", "Commands run:", ...run.commands.slice(-20).map((c) => `- \`${c.command.slice(0, 120)}\` → ${c.timedOut ? "timed out" : `exit ${c.code}`}`));
   const node = run.node ? ` on ${host(run.node)}` : "";
-  const left = result.leftSats !== undefined ? ` · ${sats(result.leftSats)} sats left there` : "";
+  const last = result.receipts.at(-1);
+  const left = satsLeft(last?.balanceSats, last?.via);
   lines.push(
     "",
     `— ${run.model}${node} · ${result.steps} step${result.steps === 1 ? "" : "s"} · ${sats(result.costSats)} of ${sats(result.budgetSats)} sats${left} · session ${run.id} (pass it as session to follow up within 30 minutes)`

@@ -58,17 +58,23 @@ export interface NodeResponse<T> {
   headers: Headers;
 }
 
+export interface RequestOptions {
+  method?: string;
+  body?: string;
+  key?: string;
+  headers?: Record<string, string>;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  maxBytes?: number;
+}
+
 /**
  * node:http rather than fetch: fetch gives up on any answer after 300 s, which a slow reasoning model
  * can need, and it cannot tell whether the request reached the node, which decides if retrying elsewhere
  * could pay twice. A fresh connection each time keeps that exact (a pooled one can be closed under us).
  * Redirects are not followed.
  */
-export async function request<T>(
-  node: string,
-  path: string,
-  init: { method?: string; body?: string; key?: string; headers?: Record<string, string>; timeoutMs?: number; signal?: AbortSignal; maxBytes?: number } = {}
-): Promise<NodeResponse<T>> {
+export async function request<T>(node: string, path: string, init: RequestOptions = {}): Promise<NodeResponse<T>> {
   const { method = "GET", body: payload, key, timeoutMs = 15_000, maxBytes = MAX_BODY_BYTES } = init;
   const url = new URL(`${node}${path}`);
   const headers: Record<string, string> = { ...init.headers, Accept: "application/json" };

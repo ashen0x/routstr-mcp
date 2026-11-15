@@ -42,6 +42,8 @@ export const config = {
   dailySats: number(process.env.ROUTSTR_DAILY_SATS, 0) || undefined,
   /** A tool call that may spend more than this asks the user first, in apps that can ask. */
   confirmSats: number(process.env.ROUTSTR_CONFIRM_SATS, 500),
+  /** routstrd's address: when it runs, it pays the nodes where this wallet has no key from its own wallet. "off" never uses it. */
+  routstrd: process.env.ROUTSTRD_URL === "off" ? undefined : process.env.ROUTSTRD_URL ?? "http://127.0.0.1:8008",
   /** Folders a subagent and file attachments may read, when the MCP app does not say which folder is open. */
   workspace: list(process.env.ROUTSTR_WORKSPACE),
 };
