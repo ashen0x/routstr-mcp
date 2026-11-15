@@ -12,6 +12,7 @@ routstr-mcp is an MCP server. Add it to Claude Code, Codex, Cursor, Claude Deskt
 | `draw` | Make pictures with a picture model and save them in your project |
 | `quote` | Estimate the cost and output limit for an exact prompt without calling a model |
 | `find_models` | Search the models on approved Routstr nodes, cheapest first, with prices in sats (`pictures: true` for picture models) |
+| `fund` | Ask you to add sats: the invoice opens as a page in your browser, never in the chat |
 | `balance` | Sats left, per node, and what was spent today |
 
 Use it to put the right model on each job: a second opinion from a different model, several models compared side by side, or a review or a self-contained change handed to a cheaper one such as Kimi, GLM, DeepSeek or Qwen. There is no account and no card: you prepay a few sats over Lightning, and that prepaid balance is the most the agent can ever spend.
@@ -83,6 +84,8 @@ Apps that show MCP prompts (Claude Code lists them as `/mcp__routstr__…`) get 
 
    It shows a Lightning invoice as a QR code. Pay it from any Lightning wallet and you are done. To fund the node that sells a model cheapest, add `--model <id>`.
 
+   In apps that can open a link for you (MCP URL elicitation, as in Claude Code), you can also just ask the agent to add sats: its `fund` tool offers you a page on your own machine with the invoice and waits until it is paid. The agent never sees the invoice.
+
 3. Ask your agent something like "ask gpt-5 for a second opinion on this function", "run a council of three models on this question" or "delegate a security review of src/ to kimi".
 
 ## Commands
@@ -108,7 +111,7 @@ routstr-mcp import --node <url>     add a Routstr key you already have (read fro
 - **Each call has a spend target.** The agent can pass `max_sats` (default 100, at most 500). This sizes the output token limit using the catalog estimate. The node settles the charge, which can exceed the target. A `delegate` run has a budget for all its steps.
 - **A big spend asks you first.** When one tool call may spend more than `ROUTSTR_CONFIRM_SATS` (500 sats), such as a council of five or a large `delegate` budget, apps that can ask (MCP elicitation, as in Claude Code) show you the amount and wait for your yes. If you say no, or the app cannot show the question right now (as when Claude Code runs with `-p`), nothing is sent. Apps without elicitation are not asked, and the call goes ahead.
 - **You can set a daily limit.** With `ROUTSTR_DAILY_SATS`, calls stop for the day once that much is spent. Every paid call is logged to `~/.routstr-mcp/spend.jsonl`; `routstr-mcp spend` sums it up.
-- **The agent never sees a secret.** API keys, invoices and Cashu tokens stay in the wallet file and the terminal, and are removed from anything a node sends back. There is no tool that funds or refunds, so the MCP tools alone cannot move your sats. An agent that also has a shell (Claude Code, Cursor) could still run the CLI or read the wallet file, so keep your app asking before it runs commands. A `delegate` subagent cannot reach the wallet: it is outside the project, and the shell sandbox blocks the home folder.
+- **The agent never sees a secret.** API keys, invoices and Cashu tokens stay in the wallet file and the terminal, and are removed from anything a node sends back. `fund` only offers you a page to pay from, and there is no tool that refunds, so the MCP tools alone cannot move your sats. An agent that also has a shell (Claude Code, Cursor) could still run the CLI or read the wallet file, so keep your app asking before it runs commands. A `delegate` subagent cannot reach the wallet: it is outside the project, and the shell sandbox blocks the home folder.
 - **The wallet is private.** It lives in `~/.routstr-mcp/wallet.json`, readable only by you. A refund token is also saved in `~/.routstr-mcp/refunds/` before the key is dropped, so a crash cannot lose it.
 - **A stopped payment is not lost.** If you pay after closing the `fund` command, the sats are picked up the next time the wallet is used.
 

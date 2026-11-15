@@ -106,6 +106,14 @@ interface InvoiceCreated {
   expires_at: number;
 }
 
+/** The amount a bolt11 invoice asks for, in sats, from its human-readable part. */
+function invoiceSats(bolt11: string): number | undefined {
+  const m = bolt11.toLowerCase().match(/^ln(?:bcrt|bc|tbs|tb|sb)(\d+)([munp]?)1/);
+  if (!m) return undefined;
+  const scale = { "": 1e8, m: 1e5, u: 1e2, n: 1e-1, p: 1e-4 }[m[2] as "" | "m" | "u" | "n" | "p"];
+  return Math.round(Number(m[1]) * scale * 1000) / 1000;
+}
+
 /** Asks the node for a Lightning invoice: a top-up when a key for that node exists, else a new key. */
 export async function createInvoice(nodeUrl: string, sats: number): Promise<Pending> {
   const node = normalizeNode(nodeUrl);
@@ -119,7 +127,7 @@ export async function createInvoice(nodeUrl: string, sats: number): Promise<Pend
   if (
     typeof body?.invoice_id !== "string" || !body.invoice_id || body.invoice_id.length > 200 ||
     typeof body.bolt11 !== "string" || !/^ln[a-z0-9]{20,}$/i.test(body.bolt11) ||
-    body.amount_sats !== sats ||
+    body.amount_sats !== sats || invoiceSats(body.bolt11) !== sats ||
     !Number.isFinite(body.expires_at) || body.expires_at < now || body.expires_at > now + 7 * 86_400
   )
     throw new Error(`${new URL(node).host} sent an invoice reply that does not look right, so it was not used.`);
@@ -141,7 +149,8 @@ export type InvoiceState = "paid" | "waiting" | "expired";
 /** Core says "expired" after an hour but still credits a late payment for a day after that. */
 const CREDIT_GRACE_S = 86_400;
 
-const dropPending = (invoiceId: string) =>
+/** Drops an invoice nobody was shown, so it is no longer waited for. */
+export const forgetInvoice = (invoiceId: string) =>
   updateWallet((wallet) => {
     wallet.pending = wallet.pending.filter((p) => p.invoiceId !== invoiceId);
   });
@@ -160,7 +169,7 @@ export async function settleInvoice(pending: Pending): Promise<InvoiceState> {
     return "paid";
   }
   if (body?.status === "expired" && pastGrace) {
-    await dropPending(pending.invoiceId);
+    await forgetInvoice(pending.invoiceId);
     return "expired";
   }
   return body?.status === "expired" ? "expired" : "waiting";

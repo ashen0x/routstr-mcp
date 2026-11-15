@@ -3,7 +3,8 @@ import readline from "node:readline";
 import { parseArgs } from "node:util";
 import qrcode from "qrcode-terminal";
 import { host, sats, version } from "./format.js";
-import { Market, normalizeNode, offersFor, unitCost } from "./market.js";
+import { fundingNode } from "./fund.js";
+import { Market, normalizeNode } from "./market.js";
 import { config } from "./config.js";
 import { balanceReport, serve } from "./server.js";
 import { readSpend, startOfToday } from "./spend.js";
@@ -31,45 +32,16 @@ const EXPIRED = "The invoice expired unpaid. If it gets paid anyway, the sats ar
 /** Node text goes to the terminal without control characters, so a node cannot send escape sequences. */
 const clean = (value: string) => value.replace(/[\p{Cc}]/gu, "");
 
-/** The amount a bolt11 invoice asks for, in sats, from its human-readable part. */
-function invoiceSats(bolt11: string): number | undefined {
-  const m = bolt11.toLowerCase().match(/^ln(?:bcrt|bc|tbs|tb|sb)(\d+)([munp]?)1/);
-  if (!m) return undefined;
-  const scale = { "": 1e8, m: 1e5, u: 1e2, n: 1e-1, p: 1e-4 }[m[2] as "" | "m" | "u" | "n" | "p"];
-  return Math.round(Number(m[1]) * scale * 1000) / 1000;
-}
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-async function pickNode(market: Market, node?: string, model?: string): Promise<string> {
-  if (node) return normalizeNode(node);
-  const { offers, pictures } = await market.load();
-  if (model) {
-    const cheapest = offersFor(offers, model).sort((a, b) => unitCost(a) - unitCost(b))[0]
-      ?? offersFor(pictures, model).sort((a, b) => a.perPicture - b.perPicture)[0];
-    if (!cheapest) throw new Error(`No approved node sells "${model}".`);
-    console.log(`${host(cheapest.node)} sells ${cheapest.id} cheapest.`);
-    return cheapest.node;
-  }
-  const funded = readWallet().keys.find((k) => offers.some((o) => o.node === k.node));
-  if (funded) return funded.node;
-  const counts = new Map<string, number>();
-  for (const o of offers) counts.set(o.node, (counts.get(o.node) ?? 0) + 1);
-  const [best] = [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
-  if (!best) throw new Error("No approved node answered. Try again, or pass --node <url>.");
-  console.log(`${host(best[0])} sells the most models (${best[1]}).`);
-  return best[0];
-}
 
 async function fund(amountArg: string | undefined, node?: string, model?: string) {
   const amount = Number(amountArg);
   if (!Number.isInteger(amount) || amount < 1 || amount > 1_000_000)
     throw new Error("Say how many sats to add, a whole number from 1 to 1,000,000. Example: routstr-mcp fund 2000");
-  const target = await pickNode(new Market(), node, model);
+  const { node: target, why } = await fundingNode(new Market(), node, model);
+  if (why) console.log(why);
   const invoice = await createInvoice(target, amount);
-  const asked = invoiceSats(invoice.bolt11);
-  if (asked !== amount)
-    throw new Error(`${host(target)} sent an invoice for ${asked === undefined ? "an unreadable amount" : `${sats(asked)} sats`} instead of ${sats(amount)}. Do not pay it.`);
   console.log(`\nPay ${sats(amount)} sats to ${invoice.key ? "top up your key on" : "open a key on"} ${host(target)}:\n`);
   qrcode.generate(invoice.bolt11, { small: true });
   console.log(`\n${invoice.bolt11}\n\nWaiting for the payment. Ctrl-C is safe: a payment made later is picked up the next time the wallet is used.`);

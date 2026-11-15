@@ -153,6 +153,41 @@ test("council asks several models at once and totals the cost", { skip }, async 
   assert.match(text, /Total: [\d.]+ sats/);
 });
 
+test("fund shows the invoice on a page in the user's browser, never to the agent, and waits for the payment", { skip }, async () => {
+  const unable = await tool("fund", { sats: 100 });
+  assert.equal(unable.isError, true);
+  assert.match(unable.text, /cannot open a payment page[\s\S]*npx routstr-mcp fund/);
+
+  const { createServer } = await import("../../src/server.js");
+  let answer: "accept" | "decline" = "decline";
+  const opened: { message: string; page: string }[] = [];
+  const app = new Client({ name: "browser", version: "0" }, { capabilities: { elicitation: { url: {} } } });
+  app.setRequestHandler(ElicitRequestSchema, async (req) => {
+    const { message, url } = req.params as { message: string; url: string };
+    // what the user's browser shows; with the fake Lightning the invoice is paid as soon as it is made
+    if (answer === "accept") opened.push({ message, page: await (await fetch(url)).text() });
+    return { action: answer };
+  });
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  await Promise.all([createServer().connect(serverSide), app.connect(clientSide)]);
+  const fund = async () => {
+    const result = (await app.callTool({ name: "fund", arguments: { sats: 100, node: nodeB.url } })) as { content: { text: string }[]; isError?: boolean };
+    assert.doesNotMatch(JSON.stringify(result), SECRET, "the agent never sees the invoice");
+    return result;
+  };
+
+  const declined = await fund();
+  assert.match(declined.content[0]!.text, /did not open the payment page/);
+  assert.equal(wallet.readWallet().pending.length, 0, "an invoice nobody saw is not waited for");
+  answer = "accept";
+  const paid = await fund();
+  assert.equal(paid.isError, false, paid.content[0]!.text);
+  assert.match(paid.content[0]!.text, new RegExp(`^Paid\\. There are 100 sats on ${new URL(nodeB.url).host} now\\.`));
+  assert.match(opened[0]!.message, /^Pay 100 sats to add them to your Routstr wallet on/);
+  assert.match(opened[0]!.page, /<h1>Pay 100 sats<\/h1>[\s\S]*<svg[\s\S]*<code>lnbc/);
+  await app.close();
+});
+
 test("a call that may spend more than ROUTSTR_CONFIRM_SATS asks the user first, and a no sends nothing", { skip }, async () => {
   const { createServer } = await import("../../src/server.js");
   const asked: string[] = [];

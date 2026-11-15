@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -6,11 +7,12 @@ import { continueAgent, findSession, report, startAgent, type AgentResult } from
 import { ask, AskError, council, draw, quote, type ContentPart } from "./calls.js";
 import { config } from "./config.js";
 import { host, perMillion, sats, tokens, version } from "./format.js";
+import { fundInBrowser, fundingNode } from "./fund.js";
 import { Market, searchModels, unitCost } from "./market.js";
 import { reasoningEffortSchema, receiptSchema, type CostReceipt } from "./receipt.js";
 import { closeSandbox, sandboxProblem } from "./sandbox.js";
 import { spentToday } from "./spend.js";
-import { balances, readWallet } from "./wallet.js";
+import { balanceOf, balances, keyFor, readWallet } from "./wallet.js";
 import { usableRoot, Workspace, WorkspaceError, type Access } from "./workspace.js";
 
 /** Where the MCP app started this server: the project folder for most apps. */
@@ -23,7 +25,8 @@ const FUND_HINT =
 const INSTRUCTIONS = `routstr-mcp lets you call AI models sold on Routstr, an open market of nodes paid in bitcoin, as tools.
 Use ask for a second opinion from a different model, council to compare several models, delegate to hand a whole task to another model that works in the project on its own (reading, searching, and with the user's say-so editing files or running commands in a sandbox), and draw to make pictures saved in the project.
 Paid calls draw from the user's prepaid Routstr balance and return cost receipts. Use quote to estimate a specific prompt before spending.
-Use find_models when you are unsure of a model id. Never ask the user for API keys, Cashu tokens or invoices. ${FUND_HINT}`;
+Use find_models when you are unsure of a model id. Never ask the user for API keys, Cashu tokens or invoices.
+When a call needs more sats and the user wants to add some, fund asks them to pay in their browser. ${FUND_HINT}`;
 
 /** The agent never sees a wallet secret, even when a node echoes one back in an answer or an error. */
 function redactor(): (value: string) => string {
@@ -487,6 +490,47 @@ export function createServer(market = new Market()): McpServer {
         return text([head, ...shown, rows.length > shown.length ? `…and ${rows.length - shown.length} more.` : ""].filter(Boolean).join("\n"));
       } catch (e) {
         return text((e as Error).message, true);
+      }
+    }
+  );
+
+  server.registerTool(
+    "fund",
+    {
+      title: "Add sats to the Routstr wallet",
+      description:
+        "Ask the user to add sats to their Routstr wallet. The app offers them a page with the Lightning invoice, which you never see, and the call waits until it is paid. " +
+        "Use it when a call fails for lack of sats and the user wants to add some. It needs an app that can open a link for the user (MCP URL elicitation); otherwise the user runs the fund command.",
+      inputSchema: {
+        sats: z.number().int().min(1).max(1_000_000).describe("How many sats to add"),
+        model: z.string().min(1).optional().describe("Add them on the node that sells this model cheapest"),
+        node: nodePin,
+      },
+      annotations: { readOnlyHint: false, openWorldHint: true },
+    },
+    async ({ sats: amount, model, node }, extra) => {
+      if (!server.server.getClientCapabilities()?.elicitation?.url) return text(`This app cannot open a payment page for the user. ${FUND_HINT}`, true);
+      const stop = heartbeat(extra as Extra, "the payment");
+      try {
+        const { node: target } = await fundingNode(market, node, model);
+        const id = randomUUID();
+        const outcome = await fundInBrowser(target, amount, async (url, message) =>
+          (await server.server.elicitInput({ mode: "url", url, message, elicitationId: id }, { timeout: 10 * 60_000 })).action === "accept", extra.signal);
+        if (outcome === "paid") {
+          await server.server.createElicitationCompletionNotifier(id)().catch(() => {});
+          const key = keyFor(target);
+          const left = key && (await balanceOf(key)).sats;
+          return text(`Paid. ${left !== undefined ? `There are ${sats(left)} sats` : "The sats are"} on ${host(target)} now.`);
+        }
+        return text(
+          outcome === "declined" ? "The user did not open the payment page, so nothing was added."
+          : `${outcome === "cancelled" ? "Stopped waiting for the payment" : "The invoice ran out unpaid"}. If it gets paid anyway, the sats are picked up the next time the wallet is used.`,
+          true
+        );
+      } catch (e) {
+        return text((e as Error).message, true);
+      } finally {
+        stop();
       }
     }
   );
