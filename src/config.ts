@@ -11,7 +11,7 @@ const list = (value: string | undefined): string[] | undefined => {
 
 const number = (value: string | undefined, fallback: number): number => {
   const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  return value?.trim() && Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 };
 
 const maxSatsPerCall = number(process.env.ROUTSTR_MAX_SATS_PER_CALL, 500);
@@ -40,6 +40,8 @@ export const config = {
   maxSatsPerTask,
   /** The most all calls together may cost in one day; unset means no daily limit beyond the prepaid balance. */
   dailySats: number(process.env.ROUTSTR_DAILY_SATS, 0) || undefined,
+  /** A tool call that may spend more than this asks the user first, in apps that can ask. */
+  confirmSats: number(process.env.ROUTSTR_CONFIRM_SATS, 500),
   /** Folders a subagent and file attachments may read, when the MCP app does not say which folder is open. */
   workspace: list(process.env.ROUTSTR_WORKSPACE),
 };

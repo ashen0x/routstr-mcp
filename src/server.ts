@@ -157,6 +157,17 @@ export function createServer(market = new Market()): McpServer {
     return usable;
   };
 
+  /** Asks the user before a call that may spend more than ROUTSTR_CONFIRM_SATS, when the app can ask; one that cannot show the question counts as no. */
+  const approve = async (what: string, most: number) => {
+    const asks = server.server.getClientCapabilities()?.elicitation;
+    if (most <= config.confirmSats || !(asks && (asks.form || !asks.url))) return;
+    const reply = await server.server
+      .elicitInput({ mode: "form", message: `${what} may spend up to ${sats(most)} sats of your Routstr balance. Go ahead?`, requestedSchema: { type: "object", properties: {} } }, { timeout: 10 * 60_000 })
+      .catch(() => undefined);
+    if (reply?.action !== "accept")
+      throw new AskError(`The user did not approve spending up to ${sats(most)} sats, so nothing was sent. Ask for less, or ask the user. (ROUTSTR_CONFIRM_SATS sets when they are asked.)`);
+  };
+
   const attachments = async (files?: string[], images?: string[]): Promise<ContentPart[] | undefined> => {
     if (!files?.length && !images?.length) return undefined;
     const local = (files?.length || images?.some((i) => !/^https:\/\//i.test(i))) ? new Workspace(await projectRoots()) : undefined;
@@ -215,9 +226,11 @@ export function createServer(market = new Market()): McpServer {
     async ({ model, prompt, system, files, images, max_sats, node, reasoning_effort }, extra) => {
       const stop = heartbeat(extra as Extra, model);
       try {
+        const parts = await attachments(files, images);
+        await approve(`Asking ${model}`, max_sats ?? config.defaultSatsPerCall);
         const { text: answer, receipt } = await ask(market, {
           model, prompt, system, node, reasoningEffort: reasoning_effort, maxSats: max_sats ?? config.defaultSatsPerCall,
-          attachments: await attachments(files, images), signal: extra.signal,
+          attachments: parts, signal: extra.signal,
         });
         return text(`${answer || "(the model returned no text)"}\n\n— ${footer(receipt)}`, false, { answer, receipt });
       } catch (e) {
@@ -259,6 +272,7 @@ export function createServer(market = new Market()): McpServer {
       let parts: ContentPart[] | undefined;
       try {
         parts = await attachments(files, images);
+        await approve(`A council of ${models.join(", ")}`, models.length * (max_sats_each ?? config.defaultSatsPerCall));
       } catch (e) {
         return text((e as Error).message, true);
       }
@@ -326,6 +340,7 @@ export function createServer(market = new Market()): McpServer {
         if (session) {
           const run = findSession(session);
           if (!run) return text(`There is no session ${session} (sessions last 30 minutes and end when the server restarts). Start a new run.`, true);
+          await approve("The delegated run's next step", budget.maxSats);
           const result = await continueAgent(market, run, { task, ...budget });
           return text(report(result), result.stopped === "error");
         }
@@ -339,6 +354,7 @@ export function createServer(market = new Market()): McpServer {
         }
         let roots = await projectRoots();
         if (cwd) roots = [new Workspace(roots).resolve(cwd)];
+        await approve(`A task delegated to ${chosen.join(", ")}`, chosen.length * budget.maxSats);
         const results: AgentResult[] = await Promise.all(
           chosen.map((m) =>
             startAgent(market, { ...budget, task, model: m, workspace: new Workspace(roots, level), system, node, reasoningEffort: reasoning_effort, files }).catch(
@@ -385,6 +401,7 @@ export function createServer(market = new Market()): McpServer {
         // a place the pictures cannot be saved is refused before anything is paid
         project.resolve(`${base}.png`, { mayNotExist: true });
         const refs = references?.map((r) => (/^https:\/\//i.test(r) ? r : project.image(r)));
+        await approve(`Drawing with ${model}`, max_sats ?? config.defaultSatsPerCall);
         const drawn = await draw(market, {
           model, prompt, references: refs, count, size, node, signal: extra.signal, maxSats: max_sats ?? config.defaultSatsPerCall,
         });

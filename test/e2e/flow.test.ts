@@ -9,6 +9,7 @@ import { after, before, test } from "node:test";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { sats } from "../../src/format.js";
 import { PAINTER, startCore, startMint, startMintProxy, startUpstream, type Service, type Upstream } from "./stack.js";
 
@@ -150,6 +151,31 @@ test("council asks several models at once and totals the cost", { skip }, async 
   assert.match(text, /## e2e-smart\nEcho: pick a number/);
   assert.match(text, /## e2e-cheap\nEcho: pick a number/);
   assert.match(text, /Total: [\d.]+ sats/);
+});
+
+test("a call that may spend more than ROUTSTR_CONFIRM_SATS asks the user first, and a no sends nothing", { skip }, async () => {
+  const { createServer } = await import("../../src/server.js");
+  const asked: string[] = [];
+  let answer: "accept" | "decline" = "decline";
+  const app = new Client({ name: "asks", version: "0" }, { capabilities: { elicitation: { form: {} } } });
+  app.setRequestHandler(ElicitRequestSchema, async (req) => (asked.push(req.params.message), { action: answer }));
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  await Promise.all([createServer().connect(serverSide), app.connect(clientSide)]);
+  const call = async (name: string, args: Record<string, unknown>) => (await app.callTool({ name, arguments: args })) as { content: { text: string }[]; isError?: boolean };
+  const calls = upstream.seen.length;
+  const big = { models: ["e2e-smart", "e2e-cheap"], prompt: "a big one", max_sats_each: 300 };
+
+  const no = await call("council", big);
+  assert.equal(no.isError, true);
+  assert.match(no.content[0]!.text, /did not approve spending up to 600 sats, so nothing was sent/);
+  assert.equal(upstream.seen.length, calls, "nothing reached a node");
+  answer = "accept";
+  assert.equal((await call("council", big)).isError, false);
+  assert.equal(upstream.seen.length, calls + 2);
+  assert.deepEqual(asked, Array(2).fill("A council of e2e-smart, e2e-cheap may spend up to 600 sats of your Routstr balance. Go ahead?"));
+  await call("ask", { model: "e2e-cheap", prompt: "a small one" });
+  assert.equal(asked.length, 2, "a call within the limit does not ask");
+  await app.close();
 });
 
 test("draw makes a picture from a reference, saves it in the project and bills what the node charged", { skip }, async () => {
