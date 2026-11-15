@@ -295,3 +295,12 @@ test("shell access runs commands in the sandbox only", async (t) => {
   assert.doesNotMatch(fs.readFileSync(path.join(project, ".git", "config"), "utf8"), /^x$/m);
   assert.match(text, /Commands run:\n- `echo made > made.txt && cat made.txt` → exit 0/);
 });
+
+test("the slash commands hand the agent a recipe for the tools", async () => {
+  const { prompts } = await client.listPrompts();
+  assert.deepEqual(prompts.map((p) => [p.name, p.arguments]), [["review", undefined], ["challenge", undefined], ["second_opinion", undefined]]);
+  const said = async (name: string) => ((await client.getPrompt({ name })).messages[0]!.content as { text: string }).text;
+  assert.match(await said("review"), /Review what I named with it[\s\S]*Call delegate with access "read"/);
+  assert.match(await said("challenge"), /argue against what I wrote with this command, or else the plan we just discussed\.\nCall ask/);
+  assert.match(await said("second_opinion"), /Call council with the models I named/);
+});

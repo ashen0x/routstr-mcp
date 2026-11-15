@@ -414,6 +414,26 @@ export function createServer(market = new Market()): McpServer {
     }
   );
 
+  // slash commands in apps that show MCP prompts. They take no arguments, because apps split
+  // arguments on spaces; the agent reads what the user typed after the command as written.
+  const otherMaker = "a model from a different maker than you (pick it with find_models)";
+  const recipes: [name: string, title: string, description: string, text: string][] = [
+    ["review", "Review with another model", "A model sold on Routstr reviews code in the project, and you check each finding before showing it.",
+      `Get an independent code review from ${otherMaker}, or the model I named with this command. Review what I named with it (a file, a folder or a commit), or else the uncommitted changes.\n` +
+      'Call delegate with access "read". In the task, say what to review and ask only for real defects, each with file:line, what goes wrong and the input or state that makes it happen. No style notes.\n' +
+      "When the report comes back, check every finding against the code yourself. Show me only the ones that hold, most severe first, then say which you dropped and why, and what the review cost."],
+    ["challenge", "Argue against the plan", "A model from another maker makes the strongest case against a plan or claim, and you say which objections hold.",
+      `Before we go ahead, have ${otherMaker} argue against what I wrote with this command, or else the plan we just discussed.\n` +
+      "Call ask with that model. Give it the plan and the context it needs, and ask for the strongest reasons it is wrong or will fail and what it would do instead, without softening anything.\n" +
+      "Then tell me which objections hold and which do not, and whether the plan should change."],
+    ["second_opinion", "Second opinions", "Two or three models from different makers answer the same question, and you compare them.",
+      "Get second opinions on what I asked with this command, or else the question we are working on.\n" +
+      "Call council with the models I named, or else two or three models from different makers (pick them with find_models). Give them the full question and the context they need from our conversation.\n" +
+      "Then compare the answers: where they agree, where they differ, and your own conclusion, with the total cost."],
+  ];
+  for (const [name, title, description, body] of recipes)
+    server.registerPrompt(name, { title, description }, () => ({ messages: [{ role: "user", content: { type: "text", text: body } }] }));
+
   return server;
 }
 

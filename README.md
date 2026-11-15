@@ -37,6 +37,14 @@ Use edit or shell on a clean git tree, so you can see and undo every change. The
 
 `max_sats` is the budget for the whole run (default 300, at most 2000) and `max_steps` the most model calls (default 30). Each step is paid as it goes, and the model is told to wrap up when the budget runs low. The report ends with a session id: pass it as `session` with a follow-up `task` within 30 minutes to continue the same run. Long runs send progress notes, and cancelling the tool call stops the run.
 
+### Slash commands
+
+Apps that show MCP prompts (Claude Code lists them as `/mcp__routstr__…`) get three ready recipes. Write what you want after the command, or nothing to use what you are working on now:
+
+- **`review`** has another model review the uncommitted changes, or the file, folder or commit you name, with `delegate`. Your agent then checks every finding against the code and shows only the ones that hold.
+- **`challenge`** has a model from another maker argue as hard as it can against the plan you just discussed, or the one you write. Your agent says which objections hold.
+- **`second_opinion`** asks two or three models from different makers the same question with `council`, and your agent compares their answers.
+
 ## Set up
 
 1. Add it to your MCP app. For Claude Code:
